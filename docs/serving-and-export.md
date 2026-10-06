@@ -637,9 +637,15 @@ Launch a local web interface to manage experiments, start training, explore data
 ```bash
 pip install "soup-cli[ui]"
 soup ui
-# -> opens http://127.0.0.1:7860 in your browser
-# -> prints auth token to console
+# -> opens http://127.0.0.1:7860/?token=<token> in your browser
+# -> prints the same URL and the token in the startup panel (also with --no-browser)
 ```
+
+The URL `soup ui` opens and prints already carries the token, so the first tab
+authenticates on its own. On a loopback bind the server swaps that token for an
+HttpOnly session cookie and redirects, as described below, so the address bar
+ends up clean and a reload or a new tab stays signed in. Your browser's history
+still records the URL it was given.
 
 > **v0.75.0 and v0.75.1: add the token to the URL yourself.** In these two
 > releases the tab `soup ui` opens carries no token, so it shows
@@ -651,7 +657,7 @@ soup ui
 > another browser needs the URL again, and the token changes every time
 > `soup ui` starts unless you pass `--auth-token`. Releases with the session
 > cookie keep a new tab signed in as well; see "Session cookie on a loopback
-> bind" below.
+> bind" below. Later versions open and print that URL themselves.
 
 **Pages:**
 - **Dashboard** — view all experiment runs, loss charts, system info, multi-run comparison
@@ -673,7 +679,7 @@ terminal panel.
 
 **Security:** The Web UI generates a random auth token at startup (printed to console). Every private endpoint — mutating (start/stop training, delete runs, inspect data, validate config) and reading (runs, metrics, system, recipes, SSE streams) — requires an `Authorization: Bearer <token>` header. `/` and `/api/health` stay open so the dashboard can load. CORS is restricted to the served origin. Data inspection is sandboxed to the working directory.
 
-**The page never stores the token.** The page reads the token from `?token=…` (the `--public` phone URL) or asks for it the first time a request is refused, then holds it in page memory only: never `sessionStorage`, `localStorage`, a cookie or a `window` property. Without the session cookie below, a reload or a new tab therefore asks for it again; paste the token `soup ui` printed (the whole `Authorization: Bearer …` line works too). If you cancel the prompt, the page stays signed out until your next click, which asks again. That is deliberate: a token persisted where page script can read it would turn a future rendering mistake into a token disclosure. It does not protect against script already running in the page; the content policy below is the defence there.
+**The page never stores the token.** The page reads the token from `?token=…` — the URL `soup ui` opens and prints, and the `--public` phone URL — whenever a non-loopback bind leaves that parameter in the URL; on a loopback bind the cookie below has already consumed it. Otherwise it asks for the token the first time a request is refused, then holds it in page memory only: never `sessionStorage`, `localStorage`, a cookie or a `window` property. Without the session cookie below, a reload or a new tab therefore asks for it again; paste the token `soup ui` printed (the whole `Authorization: Bearer …` line works too). If you cancel the prompt, the page stays signed out until your next click, which asks again. That is deliberate: a token persisted where page script can read it would turn a future rendering mistake into a token disclosure. It does not protect against script already running in the page; the content policy below is the defence there.
 
 **Session cookie on a loopback bind (#1191).** Opening `http://127.0.0.1:<PORT>/?token=<TOKEN>` checks the token, sets an `HttpOnly; SameSite=Strict; Path=/` cookie named `soup_ui_session_<PORT>` and redirects to the same URL without `token`. The cookie holds a random session id, never the token, so page script cannot read a credential, and a reload or a new tab in that browser stays signed in. The cookie belongs to the hostname you opened: signing in at `127.0.0.1` does not sign in `localhost`, so keep using the same one. It has no expiry, so it ends when the browser session does, and the server keeps the ids only in memory, so every `soup ui` restart ends every session; open the `?token=` URL again to sign back in. A request authenticated by the cookie that is not a `GET` or `HEAD` must carry an `Origin` naming this exact server (scheme, host and port) or it is refused with 403: every port of `127.0.0.1` counts as one site, so `SameSite=Strict` alone would let a page served by another local app on a different port use the cookie. The `Authorization: Bearer` header works exactly as before and needs no `Origin`, so scripts and API clients are unchanged. A wrong token sets nothing and loads the page as before. A browser that blocks cookies for `127.0.0.1` gets the token prompt after the redirect, because the token has already left the URL; paste the token there. With `--public` (or any non-loopback `--host`) no cookie is set or accepted: the phone page keeps the token in page memory, and a reload asks for it again or you re-scan the QR code. **What this does not cover:** cookies are not isolated by port, so any other server on `127.0.0.1` that your browser sends a same-site request to also receives the session cookie. Such a server can replay it outside a browser with any `Origin`, since the `Origin` check only stops browsers, and act as you in the UI, including starting training, until `soup ui` restarts.
 
