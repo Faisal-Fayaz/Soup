@@ -6,15 +6,20 @@ said nothing about the switch being dropped, because both are read only by the
 RESIDENT setup:
 
 - ``use_liger`` patches the MLP forward in ``SFTTrainerWrapper._setup_transformers``
-  (``trainer/sft.py:1588``);
+  (the Liger patch, in ``trainer/sft.py``);
 - ``use_flash_attn`` is handed to ``from_pretrained`` as ``attn_implementation`` in the
-  same method (``trainer/sft.py:1646``).
+  same method.
 
-A streamed run goes to ``_setup_streaming_transformers`` (``trainer/sft.py:761``), whose
-model is built by ``AutoModelForCausalLM.from_config(...)`` in ``build_meta_skeleton``
-(``utils/layer_stream_runtime.py:2381``) with no attention argument and no Liger patch.
+A streamed run goes to ``_setup_streaming_transformers`` (the streamed branch of
+``SFTTrainerWrapper.setup``), whose model is built by
+``AutoModelForCausalLM.from_config(...)`` in ``build_meta_skeleton``
+(``utils/layer_stream_runtime.py``) with no attention argument and no Liger patch.
 ``_liger_applied`` is never set there, so ``use_liger_kernel`` misses
 ``TrainingArguments`` too.
+
+Function names rather than line numbers: the readers move with every rebase, and a
+stale ``:1588`` in a docstring is a small lie nobody checks. The scan tests below pin
+the claim itself, so a reader moving is caught where it matters.
 
 These are the switches a user reaches for when a streamed run will not fit, so dropping
 them silently is the worst outcome: the refusal is the small step until each is wired
@@ -89,6 +94,24 @@ class TestTheSwitchesAreRefusedUnderStreaming:
         assert "from_config" in message
         assert "resident setup" in message
 
+    def test_the_clause_agrees_in_number(self) -> None:
+        """One switch named, one switch referred to.
+
+        The two mutants that survive every other assertion here write "are"/"them" for a
+        single switch, or "is"/"it" for both -- so a config with only `use_liger` reads
+        "use_liger and use_flash_attn are ... reads them", naming a switch that is not
+        set. Asserted on the raw message so the tail is the real tail.
+        """
+        one = _raw_message({"stream_layers": True, "use_liger": True})
+        assert " use_liger is never reached at all" in one
+        assert one.endswith("the only thing that reads it.")
+
+        both = _raw_message(
+            {"stream_layers": True, "use_liger": True, "use_flash_attn": True}
+        )
+        assert " use_liger and use_flash_attn are never reached at all" in both
+        assert both.endswith("the only thing that reads them.")
+
     @pytest.mark.parametrize("field", RESIDENT)
     def test_only_the_switches_that_are_set_are_named(self, field: str) -> None:
         """A message naming a switch the config did not set reads as if it were refused
@@ -150,9 +173,9 @@ class TestTheStreamedPreferencePathsAreAlreadyCovered:
 
     `stream_layers` does support dpo / kto / orpo / simpo, so these four were checked.
     They cannot reach a streamed path with either switch set, because
-    `_validate_kernel_flags_task_gate` (`schema.py:5845`) already refuses both fields
-    outside `{sft, tts}` -- the task gate fires first. So no branch is needed here; these
-    tests are what would fail if that ordering ever changed.
+    `_validate_kernel_flags_task_gate` (`soup_cli/config/schema.py`) already refuses
+    both outside `{sft, tts}` -- the task gate fires first. So no branch is needed here;
+    these tests are what would fail if that ordering ever changed.
     """
 
     @pytest.mark.parametrize("task", ["dpo", "kto", "orpo", "simpo"])

@@ -6594,15 +6594,16 @@ class SoupConfig(BaseModel):
         # setup (`sft.py::_setup_transformers`): Liger patches the MLP forward
         # there, and flash-attn is handed to `from_pretrained` as
         # `attn_implementation`. A streamed run goes to
-        # `_setup_streaming_transformers` (`sft.py:761`), and its model is built
-        # by `AutoModelForCausalLM.from_config(...)` in `build_meta_skeleton`
-        # (`utils/layer_stream_runtime.py:2381`) with NO attention argument and no
-        # Liger patch, so neither switch reaches the backend. `_liger_applied`
-        # is never set there either, so `use_liger_kernel` misses
-        # `TrainingArguments` as well. These are the switches a user reaches for
-        # when a streamed run will not fit, so silently dropping them is the
-        # worst outcome: refuse until each is wired and shown to engage on a
-        # streamed model. (`use_cut_ce` has the same shape and is #1206.)
+        # `_setup_streaming_transformers` (the streamed branch of
+        # `SFTTrainerWrapper.setup`), and its model is built by
+        # `AutoModelForCausalLM.from_config(...)` in `build_meta_skeleton`
+        # (`utils/layer_stream_runtime.py`) with NO attention argument and no Liger
+        # patch, so neither switch reaches the backend. `_liger_applied` is never
+        # set there either, so `use_liger_kernel` misses `TrainingArguments` as
+        # well. These are the switches a user reaches for when a streamed run will
+        # not fit, so silently dropping them is the worst outcome: refuse until
+        # each is wired and shown to engage on a streamed model. (`use_cut_ce` has
+        # the same shape and is #1206.)
         if tcfg.use_liger:
             conflicts.append("use_liger")
         if tcfg.use_flash_attn:
@@ -6616,9 +6617,12 @@ class SoupConfig(BaseModel):
                 f"the same layers."
             )
             # Only when a kernel switch is actually named: without one, the message has
-            # to stay byte-identical to what the other nine conflicts have always said,
-            # trailing space included, because a refusal message that grows a stray
-            # space for unrelated configs is a message nobody can pin.
+            # to stay byte-identical to what the other nine conflicts have always said.
+            # An earlier cut appended the clause unconditionally, which left all nine
+            # ending in "layers. " with a trailing space, and a control written against
+            # `str(exc.value)` could not see it -- pydantic's multi-line rendering never
+            # ends the way these messages do. Build first, append second, and pin
+            # `errors()[0]["msg"]`.
             dropped = [name for name in ("use_liger", "use_flash_attn") if name in conflicts]
             if dropped:
                 message += (
