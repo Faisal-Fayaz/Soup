@@ -175,9 +175,9 @@ format-v2 metadata records a `local-sha256:` identity derived from the
 Transformers selects (or its index and referenced shards). The identity uses
 relative file names and content, so moving the same base keeps resume valid;
 changing a selected file refuses resume. Soup checks the identity before and
-after loading the model. Each selected file is read once per run: a first
-resume from a format-v1 checkpoint reuses the identity the run already
-computed rather than reading the base a third time (#1199).
+after loading the model. A first resume from a format-v1 checkpoint reuses the
+identity the run already computed instead of reading the base a third time
+(#1199).
 A local base whose `config.json` declares another
 layer count or an incompatible width is refused before any file is hashed; a
 value that is missing or not an integer is left to the post-load gate. The
