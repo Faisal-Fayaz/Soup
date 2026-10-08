@@ -942,8 +942,18 @@ def validate_resume_metadata(
     current: dict[str, Any],
     *,
     legacy_base_model: str | None = None,
+    legacy_base_identity: str | None = None,
 ) -> None:
-    """Refuse resume when calibration or routing differs from the checkpoint."""
+    """Refuse resume when calibration or routing differs from the checkpoint.
+
+    ``legacy_base_identity`` is the already-resolved content identity of
+    ``legacy_base_model``, for a caller that holds it. #1199 fix 2: resolving it here
+    re-read and re-hashed every selected file of the local base, which the caller had
+    already done in the same run to produce ``current["base_model"]``. Passing it in
+    removes that third pass on a first v1 resume. It is compared, never trusted: the
+    equality check below is unchanged, and a caller that passes something inconsistent
+    with ``legacy_base_model`` gets the same refusal it would have got by resolving it.
+    """
     stored = load_metadata(checkpoint)
     if (
         stored["format_version"] == LEGACY_FORMAT_VERSION
@@ -958,7 +968,12 @@ def validate_resume_metadata(
                 "QuEST v1 resume requires the original base model reference; "
                 "set base: to the exact path or Hub ID recorded in the checkpoint"
             )
-        if current["base_model"] != resolve_base_model_identity(legacy_base_model):
+        identity = (
+            legacy_base_identity
+            if legacy_base_identity is not None
+            else resolve_base_model_identity(legacy_base_model)
+        )
+        if current["base_model"] != identity:
             raise ValueError("QuEST original base model reference does not match current identity")
         current = {
             **current,
