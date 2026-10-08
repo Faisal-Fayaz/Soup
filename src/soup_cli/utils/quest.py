@@ -946,13 +946,20 @@ def validate_resume_metadata(
 ) -> None:
     """Refuse resume when calibration or routing differs from the checkpoint.
 
-    ``legacy_base_identity`` is the already-resolved content identity of
-    ``legacy_base_model``, for a caller that holds it. #1199 fix 2: resolving it here
-    re-read and re-hashed every selected file of the local base, which the caller had
-    already done in the same run to produce ``current["base_model"]``. Passing it in
-    removes that third pass on a first v1 resume. It is compared, never trusted: the
-    equality check below is unchanged, and a caller that passes something inconsistent
-    with ``legacy_base_model`` gets the same refusal it would have got by resolving it.
+    ``legacy_base_identity`` is a caller-supplied content identity for
+    ``legacy_base_model``, used instead of resolving it here. #1199 fix 2: resolving it
+    here re-read and re-hashed every selected file of the local base, which the caller
+    had already done in the same run. Passing it removes that third pass on a first v1
+    resume.
+
+    It is compared, never trusted, and it is NOT interchangeable with
+    ``current["base_model"]``: a caller that passes that field instead would make the
+    check below compare ``current["base_model"]`` with itself, which can never refuse.
+    The value to pass is the identity of ``legacy_base_model`` resolved earlier in the
+    run — ``SFTTrainerWrapper._quest_base_identity_before``, which is resolved from
+    ``config.base`` before the load. Passing anything else is caught by the comparison
+    here, not accommodated: a wrong identity still gets the same refusal it would have
+    got by resolving it.
     """
     stored = load_metadata(checkpoint)
     if (

@@ -261,7 +261,11 @@ class TestTheTrainerPassesTheIdentityItAlreadyHolds:
             def save_model(self, output):
                 return None
 
+        # Deliberately DIFFERENT values: the identity of `config.base` resolved before
+        # the load is not the sidecar's `base_model` on the continuation path, and the
+        # assertion below must be able to tell the two sources apart.
         metadata = _metadata("local-sha256:" + "0" * 64)
+        before = "local-sha256:" + "1" * 64
 
         wrapper = object.__new__(SFTTrainerWrapper)
         wrapper.config = SimpleNamespace(
@@ -269,6 +273,7 @@ class TestTheTrainerPassesTheIdentityItAlreadyHolds:
             training=SimpleNamespace(activation_offloading="none", relora_steps=None),
         )
         wrapper._quest_metadata = metadata
+        wrapper._quest_base_identity_before = before
         wrapper._output_dir = str(tmp_path)
         wrapper.trainer = FakeTrainer()
         wrapper.tokenizer = SimpleNamespace(save_pretrained=lambda output: None)
@@ -298,11 +303,13 @@ class TestTheTrainerPassesTheIdentityItAlreadyHolds:
         assert seen == [
             {
                 "legacy_base_model": "some/local/base",
-                "legacy_base_identity": "local-sha256:" + "0" * 64,
+                "legacy_base_identity": before,
             }
         ], (
-            "train() must pass the identity it already holds, or the base is hashed "
-            "again on every v1 resume"
+            "train() must pass `_quest_base_identity_before` -- the identity of "
+            "`config.base` resolved before the load. Passing "
+            "`_quest_metadata['base_model']` instead makes the check compare "
+            "current['base_model'] with itself, which can never refuse."
         )
 
     def test_train_does_not_offer_an_identity_for_a_hub_base(self, tmp_path, monkeypatch):
@@ -344,6 +351,9 @@ class TestTheTrainerPassesTheIdentityItAlreadyHolds:
             training=SimpleNamespace(activation_offloading="none", relora_steps=None),
         )
         wrapper._quest_metadata = _metadata("ahxt/LiteLlama-460M-1T")
+        # A Hub base's identity is its repo id, so it costs nothing to resolve. Passing
+        # it anyway is harmless and keeps the call site unconditional.
+        wrapper._quest_base_identity_before = "ahxt/LiteLlama-460M-1T"
         wrapper._output_dir = str(tmp_path)
         wrapper.trainer = FakeTrainer()
         wrapper.tokenizer = SimpleNamespace(save_pretrained=lambda output: None)
@@ -370,6 +380,146 @@ class TestTheTrainerPassesTheIdentityItAlreadyHolds:
 
         wrapper.train(resume_from_checkpoint="checkpoint-2")
         assert seen[0]["legacy_base_identity"] == "ahxt/LiteLlama-460M-1T"
+
+
+class TestTheContinuationPathStillRefuses:
+    """The one required addition to the review: the pass may not launder a refusal.
+
+    On the continuation path `self._quest_metadata` is the artifact's sidecar, whose
+    `base_model` is the ORIGINAL base recorded at calibration, while `self.config.base`
+    is the artifact directory. The two are not equal, and the v1 check compares them.
+
+    An earlier cut of this PR passed `_quest_metadata["base_model"]` as the pre-resolved
+    identity. Since `current` *is* that metadata, the check became
+    `current["base_model"] != current["base_model"]`, which can never refuse — so the
+    keyword stopped being compared and became trusted, and a resume that is refused on
+    `main` was silently accepted. These tests drive `validate_resume_metadata` for real
+    through `train()`, so the wrong source fails here.
+    """
+
+    @staticmethod
+    def _wrapper(tmp_path, metadata, before, base):
+        import contextlib
+
+        from soup_cli.trainer.sft import SFTTrainerWrapper
+
+        class FakeModel:
+            def named_parameters(self):
+                return []
+
+        class FakeTrainer:
+            def __init__(self):
+                self.model = FakeModel()
+                self.args = SimpleNamespace(fp16=False, bf16=False, should_save=True)
+                self.state = SimpleNamespace(log_history=[], global_step=3)
+
+            def train(self, *, resume_from_checkpoint):
+                return {}
+
+            def save_model(self, output):
+                return None
+
+        wrapper = object.__new__(SFTTrainerWrapper)
+        wrapper.config = SimpleNamespace(
+            base=base,
+            training=SimpleNamespace(activation_offloading="none", relora_steps=None),
+        )
+        wrapper._quest_metadata = metadata
+        wrapper._quest_base_identity_before = before
+        wrapper._output_dir = str(tmp_path)
+        wrapper.trainer = FakeTrainer()
+        wrapper.tokenizer = SimpleNamespace(save_pretrained=lambda output: None)
+        wrapper._training_context = lambda context: contextlib.ExitStack()
+        wrapper._report_rewind = lambda: None
+        return wrapper
+
+    @staticmethod
+    def _stub(monkeypatch):
+        import soup_cli.trainer.sft as sft
+        from soup_cli.utils import ebft_gdpo, peft_wiring
+
+        for name in (
+            "attach_loraplus_optimizer",
+            "attach_relora_callback",
+            "attach_curriculum_callback",
+            "attach_plugin_callback",
+        ):
+            monkeypatch.setattr(peft_wiring, name, lambda *a, **k: None)
+        monkeypatch.setattr(ebft_gdpo, "attach_ebft_compute_loss", lambda *a: None)
+        monkeypatch.setattr(sft, "align_trainable_dtype_for_fp16", lambda *a, **k: None)
+        monkeypatch.setattr(sft, "_assert_finite_training_state", lambda *a, **k: None)
+        monkeypatch.setattr(sft, "time", SimpleNamespace(time=lambda: 0.0))
+        monkeypatch.setattr(quest, "write_metadata", lambda output, value: None)
+
+    def test_a_sidecar_naming_a_different_base_is_still_refused(self, tmp_path, monkeypatch):
+        """The continuation case: the artifact was calibrated against `original`, and the
+        run is pointing `base:` at a different directory. Refused today, and refused here
+        for the same reason — the pre-resolved identity of `config.base` is not the
+        sidecar's recorded base.
+
+        Fails if `train()` passes `_quest_metadata["base_model"]`: the comparison would
+        be `x != x` and this would not raise.
+        """
+        # v1 records the source STRING, so the checkpoint and `base:` must name the same
+        # directory for the identity comparison to be reached at all. `original` is this
+        # run's sidecar: a v2 artifact whose recorded base is `original`, while the
+        # artifact directory this run points at has a different content identity.
+        original_dir = str(tmp_path / "original-base")
+        original = _metadata("local-sha256:" + "2" * 64)
+
+        checkpoint = tmp_path / "checkpoint"
+        write_metadata(checkpoint, {**_metadata(original_dir, format_version=1)})
+
+        wrapper = self._wrapper(
+            tmp_path,
+            original,
+            before="local-sha256:" + "3" * 64,
+            base=original_dir,
+        )
+        self._stub(monkeypatch)
+
+        with pytest.raises(ValueError, match="does not match current identity"):
+            wrapper.train(resume_from_checkpoint=str(checkpoint))
+
+    def test_a_sidecar_naming_the_same_identity_is_accepted(self, tmp_path, monkeypatch):
+        """CONTROL for the refusal above: the two disagreeing values are the reason it
+        raises, not the presence of the keyword argument."""
+        identity = "local-sha256:" + "4" * 64
+        original_dir = str(tmp_path / "original-base")
+        checkpoint = tmp_path / "checkpoint"
+        write_metadata(checkpoint, {**_metadata(original_dir, format_version=1)})
+
+        wrapper = self._wrapper(
+            tmp_path,
+            _metadata(identity),
+            before=identity,
+            base=original_dir,
+        )
+        self._stub(monkeypatch)
+
+        wrapper.train(resume_from_checkpoint=str(checkpoint))
+
+    def test_the_base_is_still_not_rehashed_on_that_path(self, tmp_path, monkeypatch, hashed):
+        """The pass is removed AND the refusal survives — the two halves of this change,
+        on the path where they can conflict."""
+        identity = "local-sha256:" + "5" * 64
+        base = _base(tmp_path / "the-same-base")
+        checkpoint = tmp_path / "checkpoint"
+        write_metadata(
+            checkpoint,
+            {**_metadata(str(base), format_version=1)},
+        )
+
+        wrapper = self._wrapper(
+            tmp_path, _metadata(identity), before=identity, base=str(base)
+        )
+        self._stub(monkeypatch)
+
+        hashed.clear()
+        wrapper.train(resume_from_checkpoint=str(checkpoint))
+        assert _each_path_once(hashed) == [], (
+            "the continuation path rehashed the base; it had the identity already"
+        )
 
 
 def test_the_shard_index_and_its_shards_are_each_read_once(tmp_path, hashed):
