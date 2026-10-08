@@ -2333,11 +2333,15 @@ class SFTTrainerWrapper(StreamingSetupMixin):
                 # with itself, which can never refuse, turning the keyword from
                 # "compared" into "trusted" and silently accepting a resume that is
                 # refused today.
+                #
+                # Read with `getattr`, the same way the two setup paths read it, so a
+                # wrapper that never resolved one falls back to resolving instead of
+                # raising. `None` means "resolve as before".
                 validate_resume_metadata(
                     resume_from_checkpoint,
                     self._quest_metadata,
                     legacy_base_model=self.config.base,
-                    legacy_base_identity=self._quest_base_identity_before,
+                    legacy_base_identity=getattr(self, "_quest_base_identity_before", None),
                 )
             # Write only after a resumed checkpoint has proved compatible. A
             # rejected resume must not overwrite the root artifact's previous
