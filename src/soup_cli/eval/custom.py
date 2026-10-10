@@ -265,7 +265,8 @@ def _json_equal(expected: Any, actual: Any) -> bool:
     would separate them, which is why this rules on ``bool`` first and then defers to
     ``==``.
 
-    Not reachable from a user's config, and no secrets involved.
+    ``expected`` here is the gold side of a user's eval task file, so both arguments are
+    user-supplied; neither is a Soup config field.
     """
     # bool before everything: it is a subclass of int, so every other branch below would
     # otherwise treat True as 1.

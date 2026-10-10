@@ -90,9 +90,23 @@ class TestABooleanIsNotItsNumericTwin:
             "is wrong and must not earn argument credit."
         )
 
-    @pytest.mark.parametrize("scoring", COMPARING_SCORERS)
-    def test_the_exact_scorer_gives_no_credit_at_all(self, scoring: str) -> None:
-        assert scored(scoring, True, 1) == (0.0 if scoring == "tool_call_match" else 0.5)
+    def test_the_subset_scorer_halves_only_the_swapped_argument(self) -> None:
+        """The partial-credit arithmetic, which the single-argument cases cannot show.
+
+        Two expected arguments, one correct and one swapped: the name credit is the same
+        0.5 as `test_the_subset_scorer_keeps_exactly_its_name_credit`, and the argument
+        credit is halved rather than withheld, so 0.5 + 0.25. Reverting the matched-count
+        to `==` would make all four arguments match and score 1.0.
+        """
+        result = score_task(
+            EvalTask(
+                prompt="p",
+                expected=call_args({"enabled": True, "level": 2}),
+                scoring="tool_call_args_subset",
+            ),
+            call_args({"enabled": 1, "level": 2}),
+        )
+        assert result.score == pytest.approx(0.75)
 
     def test_the_subset_scorer_keeps_exactly_its_name_credit(self) -> None:
         """CONTROL for the 0.5. Half the score is the function name matching, which is
@@ -142,7 +156,11 @@ class TestTheSubstitutionIsCaughtInsideNesting:
         ("label", "gold", "generated"),
         [
             ("nested dict", {"a": {"b": True}}, {"a": {"b": 1}}),
-            ("inside a list", {"a": [1, 2]}, {"a": [1, True]}),
+            # The swapped element must be a bool against its own numeric twin. An
+            # earlier cut used [1, 2] vs [1, True], which compares 2 with True --
+            # different under plain `==` as well, so the case passed with the bool
+            # branch disabled and proved nothing.
+            ("inside a list", {"a": [1, 1]}, {"a": [1, True]}),
             ("list of objects", {"a": [{"b": False}]}, {"a": [{"b": 0}]}),
         ],
         ids=["nested dict", "inside a list", "list of objects"],
