@@ -1266,19 +1266,33 @@ def call_tool(
     (#1761). It gives the same three guarantees the MCP server gave, because the server
     now calls this: stray stdout goes to stderr for the duration of the handler so it
     cannot corrupt a JSON-RPC channel, the result is passed through :func:`sanitize`, and
-    every failure becomes an :class:`McpToolError` whose message is already sanitized.
+    every failure arising from the lookup or the handler becomes an
+    :class:`McpToolError` whose message is already sanitized.
 
     A handler that raises :class:`McpToolError` is passed through with its message
     sanitized; any other exception becomes ``internal error (<type>)``, which carries
-    neither a path nor a traceback.
+    neither a path nor a traceback. A ``name`` that is not hashable (a list, say) raises
+    ``TypeError`` from the lookup instead: that is a caller bug, not a tool failure, and
+    folding it into :class:`McpToolError` would hide it. Any other unknown name --
+    including an int or ``None`` -- is an ``unknown tool`` :class:`McpToolError`.
 
     Returns the Python value, not the pretty-printed JSON text, so a caller does not have
     to parse what it just called. Serialization stays the transport's business.
+
+    ``registry`` takes the tool table to run against, defaulting to
+    ``build_registry(allow_mutating=allow_mutating)``. Pass one explicitly when the table
+    needs settings ``call_tool`` cannot infer -- the execution tools are the case: build
+    it with ``build_registry(allow_mutating=True, allow_execute=True)`` and hand it in,
+    because a CLI flag like ``--allow-execute`` cannot help an in-process caller.
 
     ``allow_mutating`` mirrors ``build_registry``'s own flag. It is a second gate rather
     than a duplicate of it: a caller that built its table with ``allow_mutating=True``
     still has to ask for mutating tools by name here, so one permissive table cannot be
     used to run a mutating tool by accident.
+
+    Note for a threaded caller: the stdout guard is ``contextlib.redirect_stdout``, which
+    is process-wide. While a handler runs, prints from any other thread in the process go
+    to stderr as well. Serialize calls, or accept the extra stderr, if that matters.
     """
     specs = build_registry(allow_mutating=allow_mutating) if registry is None else registry
     by_name = {spec.name: spec for spec in specs}

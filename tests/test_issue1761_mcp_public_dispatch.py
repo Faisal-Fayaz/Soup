@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
 import sys
 
 import pytest
@@ -169,9 +170,56 @@ class TestFailuresAreMappedAndSanitized:
         assert "unknown tool" in str(excinfo.value)
         assert "not_a_tool" in str(excinfo.value)
 
+    def test_a_hashable_non_string_name_is_an_unknown_tool(self):
+        """CONTROL for the test below. An int or None reaches the lookup and misses it
+        cleanly, so the escape is specific to names the dict lookup cannot even key on."""
+        for bad in (5, None):
+            with pytest.raises(McpToolError, match="unknown tool"):
+                call_tool(bad, {}, registry=[spec()])
+
+    def test_an_unhashable_name_is_a_type_error_not_a_tool_error(self):
+        """Pinned deliberately. `call_tool(["x"])` raises TypeError from the lookup, not
+        McpToolError: passing a list as a tool name is a caller bug, and a domain error
+        would hide it. The docstring says so; this keeps the two in step."""
+        with pytest.raises(TypeError):
+            call_tool(["x"], {}, registry=[spec()])
+
 
 class TestMutatingToolsAreGated:
     """`allow_mutating` is a second gate, not a duplicate of build_registry's."""
+
+    def test_an_execute_tool_refuses_without_the_flag(self):
+        """The execute family is gated exactly like the rest of the mutating tools, and
+        by the same message -- the one that names the flag, not the server flag.
+
+        The gate fires before the handler, so `--allow-execute` never appears on this
+        path at all: that text belongs to the server, which passes allow_mutating=True
+        unconditionally and so reaches the tool's own refusal.
+        """
+        table = build_registry(allow_mutating=True, allow_execute=True)
+        with pytest.raises(McpToolError) as excinfo:
+            call_tool("train_execute", {"confirmation_token": "t"}, registry=table)
+        message = str(excinfo.value)
+        assert "allow_mutating" in message
+        assert "--allow-execute" not in message, (
+            "'soup mcp serve --allow-execute' cannot help an in-process caller; "
+            "the gate's own message must point at the flag"
+        )
+
+    def test_an_execute_table_passes_the_gate_through(self):
+        """CONTROL for the test above: with the flag, the gate is past and the tool's own
+        refusal is what answers. That is the route an in-process caller needs, and it is
+        why `call_tool` takes a `registry` argument at all."""
+        table = build_registry(allow_mutating=True, allow_execute=True)
+        with pytest.raises(McpToolError) as excinfo:
+            call_tool(
+                "train_execute",
+                {"confirmation_token": "definitely-not-a-real-token"},
+                registry=table,
+                allow_mutating=True,
+            )
+        assert "--allow-execute" not in str(excinfo.value)
+        assert "confirmation token" in str(excinfo.value)
 
     def test_a_mutating_tool_refuses_without_the_flag(self):
         with pytest.raises(McpToolError) as excinfo:
@@ -191,12 +239,31 @@ class TestMutatingToolsAreGated:
 
     def test_a_permissive_table_still_needs_the_flag_per_call(self):
         """CONTROL. This is why the gate exists at all: a caller that built its table
-        with allow_mutating=True must still ask, by name, for a mutating tool."""
-        table = build_registry(allow_mutating=True)
-        mutating = [s.name for s in table if s.mutating]
-        assert mutating, "the table should carry mutating tools when enabled"
-        with pytest.raises(McpToolError):
-            call_tool(mutating[0], {}, registry=table)
+        with allow_mutating=True must still ask, by name, for a mutating tool.
+
+        The handler records that it ran. An earlier cut only asserted that some
+        McpToolError came back, which `train_start` raises for its own reasons with
+        empty arguments -- so the test passed with the gate deleted and proved nothing.
+        Asserting the gate's own message, and that the handler never ran, is what makes
+        it fail when the gate is gone.
+        """
+        ran = []
+        table = [spec(name="mutate", handler=lambda args: ran.append(args) or {"ok": True},
+                      mutating=True)]
+
+        with pytest.raises(McpToolError) as excinfo:
+            call_tool("mutate", {}, registry=table)
+        assert "allow_mutating" in str(excinfo.value)
+        assert ran == [], "the handler ran; the gate did not hold"
+
+    def test_the_gate_is_what_stopped_it_not_the_handler(self):
+        """CONTROL for the test above. The same spec DOES run with the flag, so the
+        refusal above is the gate and not something about this tool."""
+        ran = []
+        table = [spec(name="mutate", handler=lambda args: ran.append(args) or {"ok": True},
+                      mutating=True)]
+        assert call_tool("mutate", {}, registry=table, allow_mutating=True) == {"ok": True}
+        assert ran == [{}]
 
 
 class TestItReturnsAValueNotText:
@@ -314,12 +381,20 @@ class TestTheRenameDidNotBreakAnyone:
         assert _sanitize is sanitize
 
 
-def test_module_imports_without_torch():
-    """CONTROL. registry.py's docstring promises importing it stays torch-free; this
-    guards that promise rather than trusting the comment."""
-    assert "torch" not in sys.modules or True
-    import soup_cli.mcp_server.registry as registry
+def test_importing_the_registry_does_not_pull_in_torch():
+    """CONTROL. registry.py's docstring promises importing it stays torch-free, which is
+    what lets a registry tool run without the training extras. This checks the promise
+    by importing it in a fresh interpreter rather than by reading the source: an earlier
+    cut asserted `"torch" not in sys.modules or True`, which cannot fail.
 
-    source = __import__("pathlib").Path(registry.__file__).read_text(encoding="utf-8")
-    top = source.split("def ")[0]
-    assert "import torch" not in top, "registry.py must not import torch at module level"
+    A subprocess is the only honest way to ask it. In-process, this test module has
+    already imported half of Soup, so `sys.modules` says nothing about registry.py.
+    """
+    probe = "import sys, soup_cli.mcp_server.registry as r; print('torch' in sys.modules)"
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False", (
+        "importing the registry pulled torch in; it is documented as staying cheap"
+    )
