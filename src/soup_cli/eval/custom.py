@@ -265,12 +265,6 @@ def _json_equal(expected: Any, actual: Any) -> bool:
     would separate them, which is why this rules on ``bool`` first and then defers to
     ``==``.
 
-    One consequence of deferring to ``==`` is that a NaN no longer matches a NaN. The
-    old dict ``==`` did match them, through CPython's shared NaN singleton, so this is a
-    behaviour change; it is kept, because JSON has no NaN literal at all. Python's parser
-    is lenient and will accept a bare ``NaN`` in a task file, so the case is reachable —
-    but an argument that is not a JSON value is not an answer the task asked for.
-
     ``expected`` here is the gold side of a user's eval task file, so both arguments are
     user-supplied; neither is a Soup config field.
     """
@@ -290,6 +284,14 @@ def _json_equal(expected: Any, actual: Any) -> bool:
         return len(expected) == len(actual) and all(
             _json_equal(want, got) for want, got in zip(expected, actual)
         )
+    # JSON has no NaN literal, but Python's parser accepts a bare NaN, so a task
+    # file can carry one. The old dict ``==`` matched NaN with NaN through CPython's
+    # shared singleton; keep that so recorded scores do not change (#1755).
+    if isinstance(expected, float) and isinstance(actual, float):
+        import math
+
+        if math.isnan(expected) and math.isnan(actual):
+            return True
     return bool(expected == actual)
 
 

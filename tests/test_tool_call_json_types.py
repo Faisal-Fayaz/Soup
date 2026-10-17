@@ -40,6 +40,8 @@ SUBSTITUTIONS = [
     (False, 0),
     (1, True),
     (0, False),
+    (True, False),
+    (False, True),
 ]
 
 #: (label, gold, generated) pairs that must keep scoring 1.0. `1 == 1.0` is the one that
@@ -252,51 +254,18 @@ class TestItReachesThePublicPaths:
         assert results.results[0].score == 0.5
 
 
-class TestNaNIsPinnedRatherThanAccidental:
-    """NaN used to match NaN, and now does not. That is a behaviour change, so it is
-    pinned here rather than left as an undocumented consequence of `==`.
-
-    The old dict comparison matched them through CPython's shared NaN singleton. JSON has
-    no NaN literal, so a NaN is not an answer the task asked for -- but Python's parser
-    is lenient and will read a bare `NaN` out of a task file, so the case is reachable and
-    worth a decision rather than a drift.
-    """
+class TestNaNMatchesItself:
+    """NaN is not a JSON value, but Python's parser accepts a bare one, so a task file
+    can carry it. The old dict comparison matched NaN with NaN through CPython's shared
+    singleton; keep that so recorded scores do not change (#1755)."""
 
     @staticmethod
     def _nan_call():
-        # json.dumps writes NaN unquoted and json.loads reads it back, which is how it
-        # gets into a task file at all.
         return json.dumps({"function": {"name": "f", "arguments": {"v": float("nan")}}})
 
-    def test_the_case_is_reachable_from_a_task_file(self):
-        """CONTROL. If a NaN could not survive the round trip, this whole class would be
-        testing something no real task file could produce."""
-        assert "NaN" in self._nan_call()
-        parsed = json.loads(self._nan_call())
-        assert isinstance(parsed["function"]["arguments"]["v"], float)
-
-    def test_a_nan_answer_does_not_match_a_nan_gold(self):
+    def test_a_nan_answer_matches_a_nan_gold(self):
         task = EvalTask(prompt="p", expected=self._nan_call(), scoring="tool_call_match")
-        assert score_task(task, self._nan_call()).score == 0.0
-
-    def test_the_old_comparison_would_have_matched_them(self):
-        """CONTROL: records what changed, so a future reader does not assume the old
-        behaviour still holds."""
-        nan = float("nan")
-        assert {"v": nan} == {"v": nan}, "CPython's shared singleton still makes them equal"
-        assert score_task(
-            EvalTask(prompt="p", expected=self._nan_call(), scoring="tool_call_match"),
-            self._nan_call(),
-        ).score == 0.0, "...but the scorers no longer do"
-
-    def test_an_ordinary_value_is_unaffected_by_the_nan_case(self):
-        """CONTROL. Pinning NaN must not have narrowed anything else."""
-        task = EvalTask(
-            prompt="p",
-            expected=call({"enabled": True}),
-            scoring="tool_call_match",
-        )
-        assert score_task(task, call({"enabled": True})).score == 1.0
+        assert score_task(task, self._nan_call()).score == 1.0
 
 
 class TestStringEncodedArgumentsBehaveTheSame:
