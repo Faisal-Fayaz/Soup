@@ -6,7 +6,7 @@ from reaching the client. A caller running the registry tools directly — in a 
 process, or in another application — had to reimplement all three and import the private
 ``_sanitize``, and the private name could change without notice.
 
-``registry.call_tool`` is that entry point, and ``server.py`` now calls it, so the
+``registry.call_tool`` is the helper ``server.py`` calls, so the
 guarantees cannot drift apart. These tests drive the guarantees through the public
 function rather than through the server, because a caller who never starts an MCP server
 is who the issue is about.
@@ -264,6 +264,27 @@ class TestMutatingToolsAreGated:
                       mutating=True)]
         assert call_tool("mutate", {}, registry=table, allow_mutating=True) == {"ok": True}
         assert ran == [{}]
+
+
+class TestControlBytesAreSanitizedInBothMessages:
+    """Dropping ``sanitize(name)`` from the unknown-tool or the gate-refusal message
+    must fail: a control byte in a tool name must not reach the caller."""
+
+    def test_an_unknown_tool_name_is_sanitized(self):
+        bad = "x\x1b[31m"
+        with pytest.raises(McpToolError) as excinfo:
+            call_tool(bad, {}, registry=[spec()])
+        message = str(excinfo.value)
+        assert "\x1b" not in message
+        assert "unknown tool" in message
+
+    def test_a_gated_tool_name_is_sanitized(self):
+        bad = "x\x1b[31m"
+        with pytest.raises(McpToolError) as excinfo:
+            call_tool(bad, {}, registry=[spec(name=bad, mutating=True)])
+        message = str(excinfo.value)
+        assert "\x1b" not in message
+        assert "allow_mutating" in message
 
 
 class TestItReturnsAValueNotText:

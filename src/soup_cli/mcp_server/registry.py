@@ -1262,12 +1262,15 @@ def call_tool(
 ) -> Any:
     """Run one registry tool and return its sanitized result.
 
-    The public entry point for callers that use the registry tools without speaking MCP
-    (#1761). It gives the same three guarantees the MCP server gave, because the server
-    now calls this: stray stdout goes to stderr for the duration of the handler so it
-    cannot corrupt a JSON-RPC channel, the result is passed through :func:`sanitize`, and
-    every failure arising from the lookup or the handler becomes an
-    :class:`McpToolError` whose message is already sanitized.
+    A helper for callers that run registry tools without speaking MCP (#1761): it
+    runs one tool and returns its sanitized result. The MCP server itself calls this,
+    so the two cannot drift: stray stdout goes to stderr for the duration of the
+    handler so it cannot corrupt a JSON-RPC channel, the result is passed through
+    :func:`sanitize`, and every failure arising from the lookup or the handler becomes
+    an :class:`McpToolError` whose message is already sanitized.
+
+    This is not a supported in-process Python API; it describes what the helper does
+    today.
 
     A handler that raises :class:`McpToolError` is passed through with its message
     sanitized; any other exception becomes ``internal error (<type>)``, which carries
@@ -1299,7 +1302,7 @@ def call_tool(
     spec = by_name.get(name)
     if spec is None:
         raise McpToolError(f"unknown tool: {sanitize(name)}")
-    if getattr(spec, "mutating", False) and not allow_mutating:
+    if spec.mutating and not allow_mutating:
         raise McpToolError(
             f"'{sanitize(name)}' can change state and is disabled; pass "
             "allow_mutating=True to enable it."
