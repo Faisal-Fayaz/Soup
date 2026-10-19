@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -267,32 +268,45 @@ def _json_equal(expected: Any, actual: Any) -> bool:
 
     ``expected`` here is the gold side of a user's eval task file, so both arguments are
     user-supplied; neither is a Soup config field.
-    """
-    # bool before everything: it is a subclass of int, so every other branch below would
-    # otherwise treat True as 1.
-    if isinstance(expected, bool) or isinstance(actual, bool):
-        return (
-            isinstance(expected, bool)
-            and isinstance(actual, bool)
-            and expected is actual
-        )
-    if isinstance(expected, dict) and isinstance(actual, dict):
-        return expected.keys() == actual.keys() and all(
-            _json_equal(expected[key], actual[key]) for key in expected
-        )
-    if isinstance(expected, list) and isinstance(actual, list):
-        return len(expected) == len(actual) and all(
-            _json_equal(want, got) for want, got in zip(expected, actual)
-        )
-    # JSON has no NaN literal, but Python's parser accepts a bare NaN, so a task
-    # file can carry one. The old dict ``==`` matched NaN with NaN through CPython's
-    # shared singleton; keep that so recorded scores do not change (#1755).
-    if isinstance(expected, float) and isinstance(actual, float):
-        import math
 
-        if math.isnan(expected) and math.isnan(actual):
-            return True
-    return bool(expected == actual)
+    The walk is a worklist rather than recursion, so nesting depth costs heap and not
+    Python stack: ``json.loads`` accepts an argument hundreds of levels deep, and a
+    recursive comparison raised ``RecursionError`` on one instead of scoring it. The
+    pending list cannot cycle because both sides come from ``json.loads``, which cannot
+    build a self-referential document.
+    """
+    pending: list[tuple[Any, Any]] = [(expected, actual)]
+    while pending:
+        want, got = pending.pop()
+        # bool before everything: it is a subclass of int, so every other branch below would
+        # otherwise treat True as 1.
+        if isinstance(want, bool) or isinstance(got, bool):
+            if not (isinstance(want, bool) and isinstance(got, bool) and want is got):
+                return False
+            continue
+        if isinstance(want, dict) and isinstance(got, dict):
+            if want.keys() != got.keys():
+                return False
+            pending.extend((want[key], got[key]) for key in want)
+            continue
+        if isinstance(want, list) and isinstance(got, list):
+            if len(want) != len(got):
+                return False
+            pending.extend(zip(want, got))
+            continue
+        # JSON has no NaN literal, but Python's parser accepts a bare NaN, so a task
+        # file can carry one. The old dict ``==`` matched NaN with NaN through CPython's
+        # shared singleton; keep that so recorded scores do not change (#1755).
+        if (
+            isinstance(want, float)
+            and isinstance(got, float)
+            and math.isnan(want)
+            and math.isnan(got)
+        ):
+            continue
+        if want != got:
+            return False
+    return True
 
 
 def tool_call_match(output: str, expected: str) -> bool:

@@ -80,6 +80,31 @@ def scored(scoring: str, gold: object, generated: object) -> float:
     return score_task(task(scoring, gold), call(generated)).score
 
 
+#: A depth the parser accepts and that a recursive comparison could not walk: 600 nested
+#: dicts raised `RecursionError` on the first cut, where 300 still passed.
+DEEP_DEPTH = 600
+
+#: The same nesting at a depth that worked even then. Kept beside `DEEP_DEPTH` so the
+#: deep cases cannot pass by comparison being refused wholesale at any size.
+SHALLOW_DEPTH = 100
+
+
+def nested_dict(depth: int, leaf: object) -> dict:
+    """One argument object `depth` dicts deep, `leaf` at the bottom."""
+    value = leaf
+    for _ in range(depth):
+        value = {"k": value}
+    return {"enabled": value}
+
+
+def nested_list(depth: int, leaf: object) -> dict:
+    """One argument object `depth` lists deep, `leaf` at the bottom."""
+    value = leaf
+    for _ in range(depth):
+        value = [value]
+    return {"enabled": value}
+
+
 class TestABooleanIsNotItsNumericTwin:
     """The defect: a wrong answer scored as a right one."""
 
@@ -184,6 +209,65 @@ class TestTheSubstitutionIsCaughtInsideNesting:
 
     def test_a_dict_with_a_different_key_set_does_not_score(self) -> None:
         assert scored("tool_call_match", {"a": 1}, {"a": 1, "b": 2}) == 0.0
+
+
+class TestDeeplyNestedArgumentsAreStillJudged:
+    """`json.loads` accepts deep nesting, so the scorers have to judge it too.
+
+    The first recursive cut walked the tree through Python calls and raised
+    `RecursionError` on an argument 600 levels deep: a call that the old `==` scored 1.0
+    aborted the whole eval run instead. Every case here goes through `score_task`, and
+    the shallow depth rides along because it passed even with the bug — a deep case alone
+    would not show that the fix changed nothing for arguments of ordinary size.
+    """
+
+    @pytest.mark.parametrize("scoring", COMPARING_SCORERS)
+    @pytest.mark.parametrize("depth", [SHALLOW_DEPTH, DEEP_DEPTH])
+    @pytest.mark.parametrize("build", [nested_dict, nested_list], ids=["dicts", "lists"])
+    def test_deeply_nested_equal_arguments_score(self, scoring: str, depth: int, build) -> None:
+        assert scored(scoring, build(depth, True), build(depth, True)) == 1.0, (
+            f"{depth} levels of {build.__name__}: these arguments are equal, so they must "
+            "score as they did under the old `==`. Refusing them, or returning False, "
+            "would be a policy change the issue did not ask for."
+        )
+
+    @pytest.mark.parametrize("scoring", COMPARING_SCORERS)
+    @pytest.mark.parametrize("depth", [SHALLOW_DEPTH, DEEP_DEPTH])
+    @pytest.mark.parametrize("build", [nested_dict, nested_list], ids=["dicts", "lists"])
+    def test_a_deeply_nested_substitution_does_not_score(
+        self, scoring: str, depth: int, build
+    ) -> None:
+        assert (
+            scored(scoring, build(depth, True), build(depth, 1))
+            == EXPECTED_ON_SUBSTITUTION[scoring]
+        ), (
+            f"{depth} levels of {build.__name__}: the leaf is a JSON boolean against its "
+            "numeric twin, so the defect at the bottom of the tree is the defect at the "
+            "top. The old code would have scored this 1.0, which is the point of the fix."
+        )
+
+    @pytest.mark.parametrize(
+        ("generated_leaf", "expected_score"),
+        [(True, 1.0), (1, 0.0)],
+        ids=["equal", "substitution"],
+    )
+    def test_run_eval_judges_a_deep_argument_instead_of_aborting(
+        self, generated_leaf: object, expected_score: float
+    ) -> None:
+        """The public path. Under the recursion this raised, taking the run down with it."""
+        results = run_eval(
+            model_path="unused",
+            tasks=[
+                EvalTask(
+                    prompt="set the flag",
+                    expected=call_args(nested_dict(DEEP_DEPTH, True)),
+                    scoring="tool_call_match",
+                )
+            ],
+            generate_fn=lambda prompt: call_args(nested_dict(DEEP_DEPTH, generated_leaf)),
+        )
+        assert results.results[0].score == expected_score
+        assert results.accuracy == expected_score
 
 
 class TestAMissingKeyIsStillAMissingKey:
