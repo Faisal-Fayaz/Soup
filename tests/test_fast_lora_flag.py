@@ -561,18 +561,20 @@ def test_half_precision_backward_error_is_within_twice_peft(dtype):
 
 @pytest.mark.gpu
 def test_nf4_matches_peft_over_the_same_linear4bit(tmp_path, monkeypatch):
-    """Reference: unpatched peft over the same NF4 model, never bf16."""
-    plain = _resident_wrapper_4bit(tmp_path / "plain", monkeypatch, fast_lora=False)
-    fast = _resident_wrapper_4bit(tmp_path / "fast", monkeypatch, fast_lora=True)
-    ids = torch.tensor([[1, 5, 9, 13, 2, 7, 11]], device="cuda")
-    for model in (plain, fast):
-        model(input_ids=ids, labels=ids).loss.backward()
-    torch.testing.assert_close(fast(input_ids=ids).logits, plain(input_ids=ids).logits)
-    for name, grad in _lora_grads(plain).items():
-        torch.testing.assert_close(_lora_grads(fast)[name], grad, msg=name)
+    """Reference: an fp64 oracle built from the same NF4 weights (the
+    dequantised ones, as in the #837 MLP oracle), with the #792 criterion
+    fast_error <= 2 * peft_error + 1e-8 per output and per LoRA gradient.
+    Every measured ratio is printed. (Bit-parity against peft never held on
+    a real card: the fused kernels re-order reductions.)"""
+    _run_resident_nf4_row(tmp_path, monkeypatch)
 
 
-def _resident_wrapper_4bit(tmp_path, monkeypatch, *, fast_lora):
+def _resident_wrapper_4bit(tmp_path, monkeypatch, *, fast_lora, quantization="4bit",
+                           device="cuda", base_dir=None):
+    """Resident SFT fixture; the historical name stays, but the #792 oracle
+    rows also build a ``quantization="none"`` fp64 twin through this code
+    path, on the streamed fixture's own tiny model dir so every shape and
+    weight matches the arms."""
     import yaml
 
     from soup_cli.config.loader import load_config_from_string
@@ -584,13 +586,13 @@ def _resident_wrapper_4bit(tmp_path, monkeypatch, *, fast_lora):
     cfg = load_config_from_string(
         yaml.safe_dump(
             {
-                "base": tiny_model_dir("llama"),
+                "base": str(base_dir) if base_dir else tiny_model_dir("llama"),
                 "task": "sft",
                 "data": {"train": "unused.jsonl", "max_length": 64, "chat_template": "chatml"},
                 "training": {
                     "epochs": 1,
                     "batch_size": 2,
-                    "quantization": "4bit",
+                    "quantization": quantization,
                     "fast_lora": fast_lora,
                     "lora": {"r": 4, "alpha": 8, "dropout": 0.0, "target_modules": TARGETS},
                 },
@@ -598,7 +600,7 @@ def _resident_wrapper_4bit(tmp_path, monkeypatch, *, fast_lora):
             }
         )
     )
-    wrapper = SFTTrainerWrapper(cfg, device="cuda")
+    wrapper = SFTTrainerWrapper(cfg, device=device)
     wrapper.setup({"train": _sft_rows()})
     torch.manual_seed(4)
     with torch.no_grad():
@@ -611,13 +613,198 @@ def _resident_wrapper_4bit(tmp_path, monkeypatch, *, fast_lora):
 @pytest.mark.gpu
 @pytest.mark.parametrize("quantization", ["none", "4bit"])
 def test_streamed_on_cuda_every_layer_matches(tmp_path, monkeypatch, quantization):
-    """bf16 and NF4 on the GPU, streamed on both sides (#776: streamed NF4 and
-    resident NF4 are not bit-exact on sm_120)."""
+    """bf16 (emulated on sm_75) and NF4 on the GPU, streamed on both sides
+    (#776), every layer among the checked grads; #792 (a): the fp64-oracle
+    criterion replaces bit-parity against plain streaming. Prints every
+    ratio."""
+    _run_streamed_row(tmp_path, monkeypatch, quantization)
+
+
+def _gpu_report(kind: str) -> dict:
+    """Card, driver, SM clock and library versions, printed with the ratios
+    so the numbers stay attributable to the card (#792 acceptance item 5)."""
+    import subprocess
+
+    import bitsandbytes as bnb
+    import peft
+
+    major, minor = torch.cuda.get_device_capability(0)
+    arch = f"sm_{major}{minor}"
+    bf16_mode = f"{'emulated' if major < 8 else 'native'} bf16 ({arch})"
+    payload = {
+        "row": kind,
+        "card": torch.cuda.get_device_name(0),
+        "sm": arch,
+        "bf16": bf16_mode,
+        "torch": torch.__version__,
+        "bitsandbytes": bnb.__version__,
+        "peft": peft.__version__,
+        "claim": "no end-to-end claim; parity readings on one card",
+    }
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version,clocks.sm",
+             "--format=csv,noheader,nounits"],
+            check=True, capture_output=True, text=True, timeout=20,
+        )
+        payload["driver"], payload["sm_clock_mhz"] = out.stdout.strip().split(", ")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        payload["driver"] = "nvidia-smi unavailable"
+    return payload
+
+
+def _apply_criterion(ratios, name, fast_value, peft_value, oracle):
+    """#792 (a): fast_error <= 2 * peft_error + 1e-8 against the fp64 oracle.
+
+    Mutates ``ratios[name]`` with the measured ratio, so a passing run still
+    reports every ratio; returns (fast_error, peft_error) for the log."""
+    fast_error = (fast_value.detach().double() - oracle).abs().max().item()
+    peft_error = (peft_value.detach().double() - oracle).abs().max().item()
+    ratio = fast_error / peft_error if peft_error else (float("inf") if fast_error else 0.0)
+    ratios[name] = round(ratio, 6)
+    assert fast_error <= 2.0 * peft_error + 1e-8, (
+        f"{name}: fast error {fast_error:.6g} exceeds twice peft error "
+        f"{peft_error:.6g} against the fp64 oracle"
+    )
+    return fast_error, peft_error
+
+
+def _logits_and_grads(model, ids):
+    """One forward+backward: logits captured before autograd frees them."""
+    result = model(input_ids=ids, labels=ids)
+    result.loss.backward()
+    return result.logits.detach(), _lora_grads(model)
+
+
+class _Fp64LoraProjection(torch.nn.Module):
+    """fp64 stand-in for a peft ``lora.bnb.Linear4bit`` wrapper.
+
+    Keeps the ``base_layer`` / ``lora_A`` / ``lora_B`` attribute names, so
+    parameter names match the arms for grad-by-name comparison. The base is
+    the dequantised NF4 weight widened to float64 — the same weights the
+    arms compute with, minus their low precision, as in the #837 oracle."""
+
+    def __init__(self, base, wrapper, device):
+        super().__init__()
+        from bitsandbytes.functional import dequantize_4bit
+
+        dense = dequantize_4bit(base.weight.data, base.quant_state).to(torch.float64)
+        self.base_layer = torch.nn.Linear(
+            dense.shape[1], dense.shape[0], bias=False,
+            dtype=torch.float64, device=device,
+        )
+        self.base_layer.weight.data.copy_(dense)
+        self.lora_A = torch.nn.ModuleDict()
+        self.lora_B = torch.nn.ModuleDict()
+        adapter = "default"
+        lora_a = wrapper.lora_A[adapter].weight.detach().to(torch.float64)
+        self.lora_A[adapter] = torch.nn.Linear(
+            lora_a.shape[1], lora_a.shape[0], bias=False,
+            dtype=torch.float64, device=device,
+        )
+        self.lora_A[adapter].weight.data.copy_(lora_a)
+        lora_b = wrapper.lora_B[adapter].weight.detach().to(torch.float64)
+        self.lora_B[adapter] = torch.nn.Linear(
+            lora_b.shape[1], lora_b.shape[0], bias=False,
+            dtype=torch.float64, device=device,
+        )
+        self.lora_B[adapter].weight.data.copy_(lora_b)
+        self.adapter = adapter
+        self._scaling = float(wrapper.scaling[adapter])
+
+    def forward(self, x):
+        lora = self.lora_B[self.adapter](self.lora_A[self.adapter](x))
+        return self.base_layer(x) + lora * self._scaling
+
+
+def _fp64_twin(model):
+    """Return an fp64 twin of a resident NF4 model.
+
+    Each adapted NF4 wrapper is replaced with :class:`_Fp64LoraProjection`
+    (dequantised base, adapters widened); everything else is widened with
+    ``double()`` in place. The base problem — weights and seeded adapters —
+    stays the one the arms run."""
+    import copy
+
+    from peft.tuners.lora.bnb import Linear4bit as LoraLinear4bit
+
+    twin = copy.deepcopy(model)
+    for path, module in list(twin.named_modules()):
+        if isinstance(module, LoraLinear4bit):
+            replacement = _Fp64LoraProjection(
+                module.base_layer, module,
+                device=module.base_layer.weight.device,
+            )
+            parent, _, leaf = path.rpartition(".")
+            setattr(twin.get_submodule(parent), leaf, replacement)
+    return twin.double()
+
+
+def _oracle_lora_grads(oracle):
+    return {
+        name: parameter.grad.detach().clone()
+        for name, parameter in oracle.named_parameters() if "lora_" in name
+    }
+
+
+def _run_criterion(kind, peft, fast, oracle_logits, oracle_grads):
+    """Assert the #792 criterion on logits (one output) and every adapter
+    gradient; print every ratio (partial report on violation, so a failing
+    run still hands over the ratios measured so far, per #792 item 4)."""
+    ratios = {}
+    errors = {}
+    errors["logits"] = _apply_criterion(
+        ratios, "logits", fast["logits"], peft["logits"], oracle_logits,
+    )
+    for pname, grad in oracle_grads.items():
+        try:
+            errors[pname] = _apply_criterion(
+                ratios, pname, fast["grads"][pname], peft["grads"][pname], grad,
+            )
+        except AssertionError:
+            errors[pname] = None
+            # print() rather than Rich: pytest captures stdout cleanly with
+            # `-s`, and the intact single-line JSON matches #837's style.
+            print("#792 partial " + json.dumps(
+                {**_gpu_report(kind), "ratios": ratios, "errors": errors}
+            ))
+            raise
+    print("#792 " + json.dumps(
+        {**_gpu_report(kind), "ratios": ratios, "errors": errors}
+    ))
+
+
+def _run_resident_nf4_row(tmp_path, monkeypatch):
+    plain = _resident_wrapper_4bit(tmp_path / "plain", monkeypatch, fast_lora=False)
+    fast = _resident_wrapper_4bit(tmp_path / "fast", monkeypatch, fast_lora=True)
+    oracle = _fp64_twin(plain)
+    ids = torch.tensor([[1, 5, 9, 13, 2, 7, 11]], device="cuda")
+
+    oracle_out = oracle(input_ids=ids, labels=ids)
+    oracle_out.loss.backward()
+    arms = {
+        name: {
+            "logits": logits, "grads": grads,
+        } for name, (logits, grads) in {
+            "peft": _logits_and_grads(plain, ids),
+            "fast": _logits_and_grads(fast, ids),
+        }.items()
+    }
+    _run_criterion(
+        "resident-nf4", arms["peft"], arms["fast"],
+        oracle_out.logits, _oracle_lora_grads(oracle),
+    )
+
+
+def _run_streamed_row(tmp_path, monkeypatch, quantization):
     from tests.test_v07204 import _build_streamed_wrapper
 
-    grads = {}
-    for name, flag in (("plain", False), ("fast", True)):
-        wrapper, _, _ = _build_streamed_wrapper(
+    ids = torch.tensor([[1, 5, 9, 13, 2, 7, 11]], device="cuda")
+    arms = {}
+    plain_weights = None
+    import os
+    for name, flag in (("peft", False), ("fast", True)):
+        wrapper, _, weights = _build_streamed_wrapper(
             tmp_path / name,
             monkeypatch,
             task="sft",
@@ -629,16 +816,75 @@ def test_streamed_on_cuda_every_layer_matches(tmp_path, monkeypatch, quantizatio
             fast_lora=flag,
             lora={"r": 4, "alpha": 8, "dropout": 0.0, "target_modules": TARGETS},
         )
+        if name == "peft":
+            plain_weights = os.path.abspath(weights)
         try:
             torch.manual_seed(5)
             with torch.no_grad():
                 for pname, param in wrapper.model.named_parameters():
                     if "lora_B" in pname:
                         param.normal_(std=0.1)
-            ids = torch.tensor([[1, 5, 9, 13, 2, 7, 11]], device="cuda")
-            wrapper.model(input_ids=ids, labels=ids).loss.backward()
-            grads[name] = _lora_grads(wrapper.model)
+            logits, grads = _logits_and_grads(wrapper.model, ids)
+            arms[name] = {
+                "logits": logits, "grads": grads,
+                "params": {
+                    pname: param.detach().clone()
+                    for pname, param in wrapper.model.named_parameters()
+                    if "lora_" in pname
+                },
+            }
         finally:
             wrapper._close_stream_runtime()
-    for pname, grad in grads["plain"].items():
-        torch.testing.assert_close(grads["fast"][pname], grad, msg=pname)
+
+    # fp64 oracle from the same weights, on the streamed fixture's own tiny
+    # model dir so shapes and weights match the arms exactly: resident NF4 ->
+    # dequantised twin; bf16 streaming -> the float32 twin widened exactly.
+    if quantization == "4bit":
+        oracle = _fp64_twin(_resident_wrapper_4bit(
+            tmp_path / "oracle", monkeypatch, fast_lora=False, base_dir=plain_weights,
+        ))
+    else:
+        oracle = _resident_wrapper_4bit(
+            tmp_path / "oracle", monkeypatch, fast_lora=False,
+            quantization="none", base_dir=plain_weights,
+        ).double()
+    # The streamed arms draw their lora_B themselves (seed 5 per arm); the
+    # oracle inherits the exact same problem by copying those parameters.
+    with torch.no_grad():
+        for name, parameter in oracle.named_parameters():
+            if name in arms["peft"]["params"]:
+                parameter.copy_(arms["peft"]["params"][name].to(parameter.dtype))
+    oracle_out = oracle(input_ids=ids, labels=ids)
+    oracle_out.loss.backward()
+
+    _run_criterion(
+        f"streamed-{quantization}", arms["peft"], arms["fast"],
+        oracle_out.logits, _oracle_lora_grads(oracle),
+    )
+
+
+@pytest.mark.gpu
+def test_rows_fail_when_a_kernel_drops_the_scaling(tmp_path, monkeypatch):
+    """#792 guard: the 2x rule is loose when the peft error is large, so the
+    rewritten rows must still fail on a wrong kernel. A deliberate kernel
+    break — dropping the scaling factor at the shared saturated-add seam all
+    three kernels call — must make every row raise; otherwise the criterion
+    would silently pass wrong kernels."""
+    import soup_cli.utils.fast_lora as fast_lora_single
+    import soup_cli.utils.fast_lora_mlp as fast_lora_mlp
+    import soup_cli.utils.fast_lora_qkv as fast_lora_qkv
+
+    real_add = fast_lora_single._scaled_lora_add
+
+    def unscaled_add(out, hidden, lora_b, scaling):
+        return real_add(out, hidden, lora_b, 1.0)
+
+    monkeypatch.setattr(fast_lora_single, "_scaled_lora_add", unscaled_add)
+    monkeypatch.setattr(fast_lora_mlp, "_scaled_lora_add", unscaled_add)
+    monkeypatch.setattr(fast_lora_qkv, "_scaled_lora_add", unscaled_add)
+
+    with pytest.raises(AssertionError):
+        _run_resident_nf4_row(tmp_path, monkeypatch)
+    for quantization in ("none", "4bit"):
+        with pytest.raises(AssertionError):
+            _run_streamed_row(tmp_path, monkeypatch, quantization)
