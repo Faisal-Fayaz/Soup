@@ -1450,13 +1450,17 @@ def quant_check_cmd(
     # tasks file is a usage error (exit 3) with the loader's message, not a
     # late ValueError after both models have already been loaded. The parsed
     # list is handed to run_quant_check so the file is read once, not once
-    # per model.
+    # per model. OSError (FileNotFoundError, IsADirectoryError,
+    # PermissionError, ...) and ValueError (bad JSON / schema, decoding)
+    # both mark a file the user wrote as unusable.
     from soup_cli.eval.custom import load_eval_tasks
 
     try:
         pre_tasks = load_eval_tasks(tasks)
-    except (FileNotFoundError, ValueError) as exc:
-        console.print(f"[red]{for_terminal(str(exc))}[/]")
+    except (OSError, ValueError) as exc:
+        console.print(
+            f"[red]Cannot load --tasks: {for_terminal(str(exc))}[/]"
+        )
         raise typer.Exit(EXIT_USAGE_ERROR) from exc
 
     # Live model scoring: build transformers-backed generators per side.

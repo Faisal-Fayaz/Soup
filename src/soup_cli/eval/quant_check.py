@@ -60,20 +60,11 @@ def _score_eval_tasks(tasks: "list[EvalTask]", generate_fn: Callable[[str], str]
     """Average score of an already-loaded task list through ``generate_fn``."""
     from soup_cli.eval.custom import score_task
 
-    if not tasks:
-        return 0.0
     total = 0.0
     for task in tasks:
         output = generate_fn(task.prompt)
         total += float(score_task(task, output).score)
     return total / len(tasks)
-
-
-def _score_tasks(tasks_file: str, generate_fn: Callable[[str], str]) -> float:
-    """Load a JSONL task file and return the average score."""
-    from soup_cli.eval.custom import load_eval_tasks
-
-    return _score_eval_tasks(load_eval_tasks(tasks_file), generate_fn)
 
 
 def run_quant_check(
@@ -90,12 +81,19 @@ def run_quant_check(
     ``tasks`` (a list already loaded with :func:`soup_cli.eval.custom.load_eval_tasks`,
     e.g. pre-parsed by the CLI so a bad file is refused before any model is
     loaded) takes precedence; when it is ``None`` the file named by
-    ``tasks_file`` is loaded here, as before.
+    ``tasks_file`` is loaded here, as before. Providing neither source, or
+    an empty task list, raises ``ValueError``: a check that scores zero
+    tasks would report before == after == 0.0 and measure nothing.
     """
     if tasks is None:
+        if not tasks_file:
+            raise ValueError("run_quant_check needs tasks or tasks_file")
+
         from soup_cli.eval.custom import load_eval_tasks
 
         tasks = load_eval_tasks(tasks_file)
+    if not tasks:
+        raise ValueError("No eval tasks to score")
     before = _score_eval_tasks(tasks, before_gen)
     after = _score_eval_tasks(tasks, after_gen)
     delta = after - before
