@@ -153,6 +153,24 @@ def test_missing_tasks_file_still_exits_3(cli_env, tmp_path):
     assert "--tasks not found: missing.jsonl" in _clean(result.output)
 
 
+def test_tasks_outside_cwd_is_refused_before_the_file_is_read(cli_env, forbid_models, tmp_path):
+    """The containment refusal wins over the loader: an outside-cwd --tasks
+    path is named and refused with exit 3 and its contents are never parsed,
+    whatever a row's scoring says ('SECRET' must not surface anywhere)."""
+    outside = tmp_path.parent / "outside-refusal.jsonl"
+    outside.write_text(
+        json.dumps({"prompt": "p", "expected": "a", "scoring": "SECRET"}),
+        encoding="utf-8",
+    )
+
+    result = _invoke(str(outside))
+
+    assert result.exit_code == 3, (_clean(result.output), repr(result.exception))
+    assert "is outside cwd - refusing" in _clean(result.output)
+    assert "SECRET" not in _clean(result.output)
+    assert forbid_models == []
+
+
 def test_loader_message_is_terminal_safe(cli_env, forbid_models, tmp_path, monkeypatch):
     """File-written hostile text never reaches the terminal raw.
 
