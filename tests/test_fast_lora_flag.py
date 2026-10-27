@@ -13,14 +13,14 @@ float64 oracle built from the same weights the arms compute with. Every
 violation is collected and raised once, after the full table is printed.
 The resident rows take their base from a seeded checkpoint
 (``tests.test_v07204._tiny_llama_dir``): ``tiny_model_dir`` is unseeded per
-process, which — not kernel atomics — made the resident row flip between
-runs (#2188 review).
+process, which made the resident row flip between runs.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import types
 
 import pytest
@@ -575,13 +575,13 @@ def test_nf4_matches_peft_over_the_same_linear4bit(tmp_path, monkeypatch):
     """Reference: an fp64 oracle built from the same NF4 weights (the
     dequantised ones, as in the #837 MLP oracle), with the #792 criterion
     fast_error <= 2 * peft_error + 1e-8 per output and per LoRA gradient.
-    Every measured ratio is printed. (Bit-parity against peft never held on
-    a real card: the fused kernels re-order reductions.)"""
+    Every measured ratio is printed. (Bit-parity is the wrong criterion:
+    the fused kernels re-order reductions.)"""
     _run_resident_nf4_row(tmp_path, monkeypatch)
 
 
 def _seeded_resident_base(tmp_path):
-    """A seeded resident base checkpoint (#2188 review ask 1).
+    """A seeded resident base checkpoint.
 
     The historical fixture, ``tiny_model_dir('llama')``, is cached per process
     but never seeded: every run started from different random weights (the
@@ -597,12 +597,12 @@ def _seeded_resident_base(tmp_path):
     return str(weights)
 
 
-def _resident_wrapper_4bit(tmp_path, monkeypatch, *, fast_lora, quantization="4bit",
-                           base_dir=None):
-    """Resident SFT fixture; the historical name stays, but the #792 oracle
-    rows also build a ``quantization="none"`` fp64 twin through this code
-    path, on the streamed fixture's own tiny model dir so every shape and
-    weight matches the arms. ``base_dir`` defaults to a seeded checkpoint
+def _resident_gpu_wrapper(tmp_path, monkeypatch, *, fast_lora, quantization="4bit",
+                          base_dir=None):
+    """Resident SFT fixture. The #792 oracle rows also build a
+    ``quantization="none"`` fp64 twin through this code path, on the
+    streamed fixture's own tiny model dir so every shape and weight matches
+    the arms. ``base_dir`` defaults to a seeded checkpoint
     (:func:`_seeded_resident_base`)."""
     import yaml
 
@@ -641,42 +641,17 @@ def _resident_wrapper_4bit(tmp_path, monkeypatch, *, fast_lora, quantization="4b
 @pytest.mark.gpu
 @pytest.mark.parametrize("quantization", ["none", "4bit"])
 def test_streamed_on_cuda_every_layer_matches(tmp_path, monkeypatch, quantization):
-    """bf16 (emulated on sm_75) and NF4 on the GPU, streamed on both sides
-    (#776), every layer among the checked grads; #792 (a): the fp64-oracle
-    criterion replaces bit-parity against plain streaming. Prints every
-    ratio."""
+    """bf16 (emulated on pre-Ampere cards) and NF4 on the GPU, streamed on
+    both sides (#776), every layer among the checked grads; #792 (a): the
+    fp64-oracle criterion replaces bit-parity against plain streaming.
+    Prints every ratio."""
     _run_streamed_row(tmp_path, monkeypatch, quantization)
 
 
-_LAST_BACKWARD_CLOCKS: dict = {}
-
-
-def _sm_clocks(record: bool = False) -> dict:
-    """SM clock and its maximum from nvidia-smi, and — when ``record`` is
-    set — remembered for the report, read right after a backward (#2188
-    review ask 7: a report-time-only SM clock can read its idle value and
-    say nothing about the backward that was measured)."""
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm",
-             "--format=csv,noheader,nounits"],
-            check=True, capture_output=True, text=True, timeout=20,
-        )
-        clock, clock_max = out.stdout.strip().split(", ")
-        clocks = {"clocks.sm": clock, "clocks.max.sm": clock_max}
-    except (OSError, subprocess.SubprocessError, ValueError):
-        clocks = {"clocks.sm": "nvidia-smi unavailable", "clocks.max.sm": "?"}
-    if record:
-        _LAST_BACKWARD_CLOCKS.update(clocks)
-    return clocks
-
-
 def _gpu_report(kind: str) -> dict:
-    """Card, driver, SM clocks (report time and right after the row's last
-    backward) and library versions, printed with the ratios so the numbers
-    stay attributable to the card (#792 acceptance item 5)."""
+    """Card, driver, SM clocks at report time and library versions, printed
+    with the ratios so the numbers stay attributable to the card (#792
+    acceptance item 5)."""
     import subprocess
 
     import bitsandbytes as bnb
@@ -705,10 +680,6 @@ def _gpu_report(kind: str) -> dict:
         payload["clocks.sm"], payload["clocks.max.sm"] = clocks, clocks_max
     except (OSError, subprocess.SubprocessError, ValueError):
         payload["driver"] = "nvidia-smi unavailable"
-    enqueue = {}
-    for key, value in _LAST_BACKWARD_CLOCKS.items():
-        enqueue[f"{key}_after_last_backward"] = value
-    payload.update(enqueue)
     return payload
 
 
@@ -718,8 +689,8 @@ def _apply_criterion(ratios, violations, name, fast_value, peft_value, oracle):
     Measures — never raises. Mutates ``ratios[name]`` with the measured ratio
     (a passing run still reports every ratio) and collects every name whose
     fast error exceeds the criterion into ``violations``, so the caller can
-    print the whole table before asserting anything (#2188 review ask 4).
-    Returns (fast_error, peft_error) for the log."""
+    print the whole table before asserting anything. Returns
+    (fast_error, peft_error) for the log."""
     fast_error = (fast_value.detach().double() - oracle).abs().max().item()
     peft_error = (peft_value.detach().double() - oracle).abs().max().item()
     ratio = fast_error / peft_error if peft_error else (float("inf") if fast_error else 0.0)
@@ -730,11 +701,9 @@ def _apply_criterion(ratios, violations, name, fast_value, peft_value, oracle):
 
 
 def _logits_and_grads(model, ids):
-    """One forward+backward: logits captured before autograd frees them, and
-    the SM clock read immediately after the backward for the report."""
+    """One forward+backward; logits captured before autograd frees them."""
     result = model(input_ids=ids, labels=ids)
     result.loss.backward()
-    _sm_clocks(record=True)
     return result.logits.detach(), _lora_grads(model)
 
 
@@ -827,16 +796,20 @@ _ORACLE_LOGITS_BOUND = 1e-2
 
 def _measure_criterion(kind, peft, fast, oracle_logits, oracle_grads):
     """Measure the #792 criterion on logits (one output) and every adapter
-    gradient, asserting nothing until the full report is out (#792 item 4,
-    #2188 review ask 4). Prints one intact ``#792 {...}`` line with every
-    ratio — print() rather than Rich, so pytest captures stdout cleanly with
-    ``-s``, and the intact single-line JSON matches #837's style — then
-    returns the measured (ratios, violations, errors).
+    gradient, asserting nothing until the full report is out (#792 item 4).
+    Prints one intact ``#792 {...}`` line with every ratio — print() rather
+    than Rich, so pytest captures stdout cleanly with ``-s``, and the intact
+    single-line JSON matches #837's style — then returns the measured
+    (ratios, violations, errors, oracle_drift).
 
-    The peft logits error doubles as the oracle-fidelity readout (ask 3):
+    The count assertion pins that every oracle gradient was measured; a
+    variant that silently checks fewer names would leave the verdict
+    unchanged. The peft logits error doubles as the oracle-fidelity readout:
     it should stay far below a logit digit bound ``_ORACLE_LOGITS_BOUND`` —
     a bigger gap means the oracle's weights have drifted from what the arms
-    compute with, and the ratios would mean nothing."""
+    compute with, and the ratios would mean nothing. ``oracle_drift`` carries
+    that failure to the single final assertion, together with the violations.
+    """
     ratios: dict = {}
     violations: dict = {}
     errors: dict = {}
@@ -854,51 +827,60 @@ def _measure_criterion(kind, peft, fast, oracle_logits, oracle_grads):
         "ratios": ratios,
         "errors": errors,
     }))
+    assert len(ratios) == 1 + len(oracle_grads), (
+        f"measured {len(ratios)} output(s) for {len(oracle_grads)} oracle "
+        "gradient(s) plus the logits; a name was skipped"
+    )
     logits_peft_error = errors["logits"][1]
-    assert logits_peft_error <= _ORACLE_LOGITS_BOUND, (
-        f"peft logits error against the fp64 oracle is {logits_peft_error:.6g}, "
-        f"above {_ORACLE_LOGITS_BOUND}: the oracle's weights have drifted from "
-        "what the arms compute with, so the measured ratios mean nothing"
-    )
-    return ratios, violations, errors
+    oracle_drift = None
+    if logits_peft_error > _ORACLE_LOGITS_BOUND:
+        oracle_drift = (
+            f"peft logits error against the fp64 oracle is {logits_peft_error:.6g}, "
+            f"above {_ORACLE_LOGITS_BOUND}: the oracle's weights have drifted from "
+            "what the arms compute with, so the measured ratios mean nothing"
+        )
+    return ratios, violations, errors, oracle_drift
 
 
-def _assert_criterion(violations):
-    """One assertion, listing EVERY measured name above the criterion, in
-    place of the old first-violation stop (#2188 review ask 4)."""
-    if not violations:
+def _assert_criterion(violations, oracle_drift=None):
+    """One assertion, listing EVERY measured name above the criterion and,
+    when present, the oracle-fidelity failure — both in one message, in
+    place of the old first-violation stop."""
+    if not violations and oracle_drift is None:
         return
-    detail = "; ".join(
-        f"{name}: fast error {fast:.6g} exceeds twice peft error {peft:.6g} "
-        "against the fp64 oracle"
-        for name, (fast, peft) in sorted(violations.items())
-    )
-    raise AssertionError(
-        f"#792 criterion violated by {len(violations)} measured name(s): {detail}"
-    )
+    parts = [] if oracle_drift is None else [oracle_drift]
+    if violations:
+        detail = "; ".join(
+            f"{name}: fast error {fast:.6g} exceeds twice peft error {peft:.6g} "
+            "against the fp64 oracle"
+            for name, (fast, peft) in sorted(violations.items())
+        )
+        parts.append(
+            f"#792 criterion violated by {len(violations)} measured name(s): {detail}"
+        )
+    raise AssertionError("\n".join(parts))
 
 
 def _run_criterion(kind, peft, fast, oracle_logits, oracle_grads):
     """Measure the criterion, print the full report, then raise once over the
     collected violations. Returns the ratio table either way."""
-    ratios, violations, _ = _measure_criterion(
+    ratios, violations, _, oracle_drift = _measure_criterion(
         kind, peft, fast, oracle_logits, oracle_grads,
     )
-    _assert_criterion(violations)
+    _assert_criterion(violations, oracle_drift)
     return ratios
 
 
 def _run_resident_nf4_row(tmp_path, monkeypatch):
     """Resident NF4 row; returns the measured ratios. Both arms share ONE
-    seeded base so the row is deterministic across processes (#2188 review
-    ask 1: the resident flips came from ``tiny_model_dir``'s unseeded
-    per-process weights, not kernel atomics)."""
-    _LAST_BACKWARD_CLOCKS.clear()
+    seeded base so the row is deterministic across processes (the resident
+    flips came from ``tiny_model_dir``'s unseeded per-process weights, not
+    kernel atomics)."""
     base_dir = _seeded_resident_base(tmp_path)
-    plain = _resident_wrapper_4bit(
+    plain = _resident_gpu_wrapper(
         tmp_path / "plain", monkeypatch, fast_lora=False, base_dir=base_dir,
     )
-    fast = _resident_wrapper_4bit(
+    fast = _resident_gpu_wrapper(
         tmp_path / "fast", monkeypatch, fast_lora=True, base_dir=base_dir,
     )
     oracle = _fp64_twin(plain)
@@ -922,14 +904,19 @@ def _run_resident_nf4_row(tmp_path, monkeypatch):
 
 
 def _streamed_nf4_denses(model, runtime):
-    """Dequantise the NF4 weights the streamed runtime actually loads
-    (#2188 review ask 2): the runtime's own shard bytes via
+    """Dequantise the NF4 weights the streamed runtime actually loads:
+    the runtime's own shard bytes via
     ``runtime.source.get``, its per-weight ``QuantState`` reassembly
     (``rebuild_quant_state``) and the same
     ``bitsandbytes.functional.dequantize_4bit`` call the runtime's dense
     paths make (``layer_stream_runtime``'s dequantise sites) — NOT a
     resident re-quantisation of the same files. Keyed by
-    ``"layers.<idx>.<weight-name-within-the-layer>"``."""
+    ``"layers.<idx>.<weight-name-within-the-layer>"``.
+
+    ``StreamedDecoderLayer`` is transparent to ``model.modules()``; only
+    ``streamed_decoder_layers`` reaches it through its parent's ``_modules``.
+    An empty capture is impossible: the count is asserted against the seven
+    adapted projections of all four layers."""
     import bitsandbytes.functional as bnb_functional
 
     from soup_cli.utils.layer_shard import (
@@ -937,15 +924,15 @@ def _streamed_nf4_denses(model, runtime):
         NESTED_ABSMAX_SUFFIX,
         NESTED_OFFSET_SUFFIX,
     )
-    from soup_cli.utils.layer_stream_runtime import rebuild_quant_state
+    from soup_cli.utils.layer_stream_runtime import (
+        rebuild_quant_state,
+        streamed_decoder_layers,
+    )
 
     source = runtime.source
     dense: dict = {}
-    for module in model.modules():
-        name_map = getattr(module, "name_map", None)
-        if not name_map:
-            continue
-        for inner_name, ckpt in name_map.items():
+    for module in streamed_decoder_layers(model):
+        for inner_name, ckpt in module.name_map.items():
             spec = module.quant_specs.get(ckpt)
             if spec is None:
                 continue  # a non-quantised weight inside the same layer
@@ -961,13 +948,22 @@ def _streamed_nf4_denses(model, runtime):
             dense[f"layers.{module.idx}.{inner_name}"] = bnb_functional.dequantize_4bit(
                 packed, state
             )
+    assert len(dense) == 4 * len(TARGETS), (
+        f"captured {len(dense)} streamed NF4 weights, expected {4 * len(TARGETS)}"
+    )
     return dense
 
 
 def _replace_with_streamed_denses(oracle, dense):
     """Write the runtime's own dequants — rounded to the bf16 compute dtype
     the streamed arms run at — into the twin's adapted base layers.
-    Returns how many weights were written."""
+    Returns how many weights were written.
+
+    Where the runtime's bytes and a resident re-quantisation of the same
+    checkpoint differ by less than a bf16 ulp, the rounded weights coincide
+    and so do the measured ratios: the oracle still carries the weights the
+    streamed arms compute with, and ``_streamed_nf4_denses`` asserts the
+    capture is not empty."""
     written = 0
     with torch.no_grad():
         for name, parameter in oracle.named_parameters():
@@ -975,15 +971,14 @@ def _replace_with_streamed_denses(oracle, dense):
             if parts[-2:] != ["base_layer", "weight"]:
                 continue
             after_layers = parts.index("layers") + 1
-            relative = ".".join(parts[after_layers + 1:-2]) + ".weight"
-            key = f"layers.{parts[after_layers]}.{relative}"
+            key = f"layers.{parts[after_layers]}." + ".".join(parts[after_layers + 1:])
             if key not in dense:
                 continue
             parameter.copy_(
                 dense[key].detach().to(torch.bfloat16).to(parameter.dtype)
             )
             written += 1
-    if written != len(dense):
+    if not dense or written != len(dense):
         twin_sample = sorted(
             name for name, _ in oracle.named_parameters()
             if name.split(".")[-2:] == ["base_layer", "weight"]
@@ -1008,15 +1003,14 @@ def _792_ratios(stdout: str) -> dict:
 def _run_streamed_row(tmp_path, monkeypatch, quantization):
     """Streamed row on CUDA (#792 a); returns the measured ratios.
 
-    The fp64 oracle carries the weights the arms actually compute with
-    (#2188 review ask 2): streaming runs bf16 on CUDA, so non-LoRA
-    parameters take one bf16 rounding before the float64 widening; in the
-    NF4 row the adapted base weights come from the streamed runtime's own
-    shard store, QuantState reassembly and dequantise, not from a resident
-    re-quantisation of the same files."""
+    The fp64 oracle carries the weights the arms actually compute with:
+    streaming runs bf16 on CUDA, so non-LoRA parameters take one bf16
+    rounding before the float64 widening; in the NF4 row the adapted base
+    weights come from the streamed runtime's own shard store, QuantState
+    reassembly and dequantise, not from a resident re-quantisation of the
+    same files."""
     from tests.test_v07204 import _build_streamed_wrapper
 
-    _LAST_BACKWARD_CLOCKS.clear()
     ids = torch.tensor([[1, 5, 9, 13, 2, 7, 11]], device="cuda")
     arms = {}
     plain_weights = None
@@ -1062,12 +1056,16 @@ def _run_streamed_row(tmp_path, monkeypatch, quantization):
     # fp64 oracle from the same weights, on the streamed fixture's own tiny
     # model dir so every shape matches the arms.
     if quantization == "4bit":
-        oracle = _fp64_twin(_resident_wrapper_4bit(
+        oracle = _fp64_twin(_resident_gpu_wrapper(
             tmp_path / "oracle", monkeypatch, fast_lora=False, base_dir=plain_weights,
         ))
-        _replace_with_streamed_denses(oracle, plain_denses)
+        written = _replace_with_streamed_denses(oracle, plain_denses)
+        print(
+            f"#792 capture row=streamed-{quantization} "
+            f"captured={len(plain_denses)} written={written}"
+        )
     else:
-        oracle = _resident_wrapper_4bit(
+        oracle = _resident_gpu_wrapper(
             tmp_path / "oracle", monkeypatch, fast_lora=False,
             quantization="none", base_dir=plain_weights,
         )
@@ -1121,9 +1119,8 @@ def test_rows_fail_when_a_kernel_drops_the_scaling(tmp_path, monkeypatch, capsys
     """#792 guard for the criterion-rewritten rows. A deliberate kernel
     break — dropping the scaling factor at the shared saturated-add seam all
     three kernels call — must make every row raise with the criterion's
-    message, while the run's own table shows the break's logits ratio well
-    above the criterion (>= 4 here; the drop measured 10.3 at its floor on
-    the dev card) #2188 review ask 5. Conversely an unmutated row must sit
+    message, while the run's own table shows the break's logits ratio far
+    above the 2x criterion (>= 4 here). Conversely an unmutated row must sit
     below 2 on logits, so the guard never trips by accident."""
     rows = (
         ("resident", lambda sub: _run_resident_nf4_row(sub, monkeypatch)),
@@ -1166,10 +1163,10 @@ def test_rows_fail_when_a_kernel_drops_the_scaling(tmp_path, monkeypatch, capsys
 
 
 class TestTheCriterionOnCPU:
-    """The #792 criterion function itself, on plain CPU tensors (#2188
-    review ask 8): 1.9x peft error passes, 2.1x is collected as a
-    violation — including the zero-peft corners it must not divide on.
-    (These run without CUDA; the measurement core is pure tensor math.)"""
+    """The #792 criterion function itself, on plain CPU tensors: 1.9x peft
+    error passes, 2.1x is collected as a violation — including the
+    zero-peft corners it must not divide on and the +1e-8 boundary. (These
+    run without CUDA; the measurement core is pure tensor math.)"""
 
     @staticmethod
     def _measured(fast_value, peft_value):
@@ -1212,3 +1209,63 @@ class TestTheCriterionOnCPU:
         )
         assert ratios == {"grad": 0.0}
         assert violations == {}
+
+    @pytest.mark.parametrize(
+        ("fast_value", "violates"),
+        [(5e-9, False), (2e-8, True)],
+        ids=["inside-the-epsilon", "outside-the-epsilon"],
+    )
+    def test_the_plus_one_nano_boundary(self, fast_value, violates):
+        """The +1e-8 term is load-bearing: 5e-9 against a zero peft error
+        passes, 2e-8 violates, so dropping the term changes a verdict."""
+        ratios, violations, _ = self._measured(
+            torch.tensor([fast_value], dtype=torch.float64),
+            torch.zeros(1, dtype=torch.float64),
+        )
+        assert ratios == {"grad": float("inf")}
+        assert ("grad" in violations) is violates
+
+    def test_assert_criterion_returns_without_violations(self):
+        assert _assert_criterion({}) is None
+
+    def test_assert_criterion_raises_once_with_every_violation(self):
+        with pytest.raises(AssertionError) as excinfo:
+            _assert_criterion({
+                "layers.0.q_proj.lora_A": (2.0, 1.0),
+                "layers.1.q_proj.lora_B": (3.0, 1.0),
+            })
+        message = str(excinfo.value)
+        assert "#792 criterion violated by 2 measured name(s)" in message
+        assert "layers.0.q_proj.lora_A" in message
+        assert "layers.1.q_proj.lora_B" in message
+        assert message.count("exceeds twice peft error") == 2
+
+    def test_a_bound_failure_and_violations_share_one_message(self):
+        with pytest.raises(AssertionError) as excinfo:
+            _assert_criterion(
+                {"layers.0.q_proj.lora_A": (2.0, 1.0)},
+                "peft logits error against the fp64 oracle is 0.02, above 0.01",
+            )
+        message = str(excinfo.value)
+        assert "above 0.01" in message
+        assert "exceeds twice peft error" in message
+
+    def test_oracle_drift_is_measured_before_the_assertion(self, monkeypatch):
+        """The bound is measured, not hard-wired: a peft logits error of
+        0.02 against the fp64 oracle comes back as drift, which the caller's
+        single assertion then raises with."""
+        monkeypatch.setattr(
+            sys.modules[__name__], "_gpu_report", lambda kind: {"row": kind},
+        )
+        oracle = torch.zeros(1, dtype=torch.float64)
+        peft = {"logits": torch.tensor([0.02], dtype=torch.float64), "grads": {}}
+        fast = {"logits": torch.tensor([0.021], dtype=torch.float64), "grads": {}}
+        ratios, violations, errors, drift = _measure_criterion(
+            "synthetic", peft, fast, oracle, {},
+        )
+        assert ratios == {"logits": 1.05}
+        assert violations == {}
+        assert errors["logits"] == pytest.approx((0.021, 0.02))
+        assert drift is not None and "above 0.01" in drift
+        with pytest.raises(AssertionError, match="above 0.01"):
+            _assert_criterion(violations, drift)
