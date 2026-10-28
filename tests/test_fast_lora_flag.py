@@ -842,22 +842,44 @@ def _measure_criterion(kind, peft, fast, oracle_logits, oracle_grads):
     return ratios, violations, errors, oracle_drift
 
 
-def _assert_criterion(violations, oracle_drift=None):
+# Readings recorded on #792 for rows a card holds above the 2x criterion. Such a
+# row stays red (threshold unchanged, no xfail); its failure names these numbers.
+_RECORDED_ON_792 = {
+    "resident-nf4": (
+        "GTX 1650 (sm_75): 2.198071 layers.1.mlp.up_proj.lora_B, "
+        "2.176624 layers.1.mlp.gate_proj.lora_B"
+    ),
+    "streamed-4bit": (
+        "RTX 5070 Laptop (sm_120): 3.038320 layers.3.mlp.up_proj.lora_B, "
+        "2.3113 layers.0.self_attn.q_proj.lora_A, 2.0076 layers.1.mlp.gate_proj.lora_B"
+    ),
+}
+
+
+def _assert_criterion(violations, oracle_drift=None, kind=None):
     """One assertion, listing EVERY measured name above the criterion and,
     when present, the oracle-fidelity failure — both in one message, in
-    place of the old first-violation stop."""
+    place of the old first-violation stop. A row a card holds above the
+    criterion also names the numbers recorded on #792, so the next reader can
+    tell a known red row from a new one."""
     if not violations and oracle_drift is None:
         return
     parts = [] if oracle_drift is None else [oracle_drift]
     if violations:
         detail = "; ".join(
-            f"{name}: fast error {fast:.6g} exceeds twice peft error {peft:.6g} "
+            f"{name}: ratio {fast / peft if peft else float('inf'):.6f}, "
+            f"fast error {fast:.6g} exceeds twice peft error {peft:.6g} "
             "against the fp64 oracle"
             for name, (fast, peft) in sorted(violations.items())
         )
         parts.append(
             f"#792 criterion violated by {len(violations)} measured name(s): {detail}"
         )
+        if kind in _RECORDED_ON_792:
+            parts.append(
+                f"Recorded on #792 for {kind} (threshold 2x + 1e-8 unchanged, "
+                f"no xfail): {_RECORDED_ON_792[kind]}"
+            )
     raise AssertionError("\n".join(parts))
 
 
@@ -867,7 +889,7 @@ def _run_criterion(kind, peft, fast, oracle_logits, oracle_grads):
     ratios, violations, _, oracle_drift = _measure_criterion(
         kind, peft, fast, oracle_logits, oracle_grads,
     )
-    _assert_criterion(violations, oracle_drift)
+    _assert_criterion(violations, oracle_drift, kind)
     return ratios
 
 
@@ -1134,9 +1156,12 @@ def test_rows_fail_when_a_kernel_drops_the_scaling(tmp_path, monkeypatch, capsys
             row(tmp_path / f"clean-{name}")
         except AssertionError as error:
             # A clean row may yet fail the 2x criterion on some names — that
-            # is a recorded result, per the #792 ruling; anything else is a
-            # test defect and rises.
-            if "exceeds twice peft error" not in str(error):
+            # is a recorded result, per the #792 ruling; anything else, drift
+            # alongside a violation included, is a test defect and rises.
+            if (
+                "exceeds twice peft error" not in str(error)
+                or "drifted" in str(error)
+            ):
                 raise
         clean = _792_ratios(capsys.readouterr().out)
         assert clean["logits"] < 2, (name, clean)
@@ -1269,3 +1294,39 @@ class TestTheCriterionOnCPU:
         assert drift is not None and "above 0.01" in drift
         with pytest.raises(AssertionError, match="above 0.01"):
             _assert_criterion(violations, drift)
+
+    @pytest.mark.parametrize(
+        ("kind", "figures"),
+        [
+            ("streamed-4bit", ("3.038320", "2.3113", "2.0076")),
+            ("resident-nf4", ("2.198071", "2.176624")),
+        ],
+    )
+    def test_a_red_row_names_792_and_the_recorded_numbers(self, kind, figures):
+        with pytest.raises(AssertionError) as excinfo:
+            _assert_criterion({"layers.3.mlp.up_proj.lora_B": (3.0, 1.0)}, kind=kind)
+        message = str(excinfo.value)
+        assert "ratio 3.000000" in message
+        assert f"Recorded on #792 for {kind}" in message
+        for figure in figures:
+            assert figure in message
+
+    def test_measure_criterion_covers_every_oracle_name(self, monkeypatch):
+        """The count assertion is visible on CPU: synthetic gradients for all
+        four layers come back in the ratio table, logits included."""
+        monkeypatch.setattr(
+            sys.modules[__name__], "_gpu_report", lambda kind: {"row": kind},
+        )
+        names = [
+            f"layers.{layer}.self_attn.q_proj.lora_A.default.weight"
+            for layer in range(4)
+        ]
+        zeros = {name: torch.zeros(2, dtype=torch.float64) for name in names}
+        oracle = torch.zeros(1, dtype=torch.float64)
+        peft = {"logits": torch.zeros(1, dtype=torch.float64), "grads": dict(zeros)}
+        fast = {"logits": torch.zeros(1, dtype=torch.float64), "grads": dict(zeros)}
+        ratios, violations, _, drift = _measure_criterion(
+            "synthetic", peft, fast, oracle, zeros,
+        )
+        assert set(ratios) == {"logits", *names}
+        assert violations == {} and drift is None
