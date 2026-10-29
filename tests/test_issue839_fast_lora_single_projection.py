@@ -29,10 +29,11 @@ Asserted on CPU (no CUDA needed):
   contract); patching is counted, idempotent and reversible.
 - A 4-layer tiny Llama with 2 stream buffers: the patched streamed model's loss
   and all 16 adapter grads match the resident twin (#331 shape).
-- A 4-layer NF4 ``o_proj`` streamed model with 2 buffers: its backward reaches
-  every layer's adapter. The kernel must read ``ctx.saved_tensors`` once; a
-  second read raises ``CheckpointError`` under the streamed unpack hook, and
-  this test keeps that contract pinned.
+- A 4-layer NF4 ``o_proj`` streamed model with 2 buffers, compared against a
+  second unpatched streamed twin: loss and every layer's ``o_proj`` adapter
+  grads match at ``rtol=1e-4, atol=1e-5``. The kernel must read
+  ``ctx.saved_tensors`` once; a second read raises ``CheckpointError`` under the
+  streamed unpack hook, and this test keeps that contract pinned.
 - Saved-for-backward bytes are not worse than peft's graph at the unit shapes
   (measured equal; the assertion is ``<=``).
 - The kernel's own grad_fn is asserted on CPU across bias, rank, and dtypes
@@ -151,7 +152,10 @@ def _nf4_streamed_oproj(tmp_path, *, device, dtype, n_layers=4, buffers=2):
     weights.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(7)
     save_file(
-        {k: v.contiguous() for k, v in LlamaForCausalLM(config).state_dict().items()},
+        {
+            name: tensor.contiguous()
+            for name, tensor in LlamaForCausalLM(config).state_dict().items()
+        },
         str(weights / "model.safetensors"),
     )
     config.save_pretrained(str(weights))
@@ -194,9 +198,9 @@ def _sync_adapters(dst, src):
     import torch
 
     source = {
-        k.replace(".inner.", "."): v.detach().clone()
-        for k, v in src.state_dict().items()
-        if "lora_" in k
+        name.replace(".inner.", "."): tensor.detach().clone()
+        for name, tensor in src.state_dict().items()
+        if "lora_" in name
     }
     copied = 0
     with torch.no_grad():
@@ -1303,7 +1307,10 @@ class TestStreamedModel:
         weights = tmp_path / "model"
         weights.mkdir(parents=True, exist_ok=True)
         save_file(
-            {k: v.contiguous() for k, v in LlamaForCausalLM(config).state_dict().items()},
+            {
+                name: tensor.contiguous()
+                for name, tensor in LlamaForCausalLM(config).state_dict().items()
+            },
             str(weights / "model.safetensors"),
         )
         config.save_pretrained(str(weights))
@@ -1390,7 +1397,10 @@ class TestNf4StreamedOProjCheckpoint:
     ``torch.utils.checkpoint``. A second ``ctx.saved_tensors`` read there raises
     ``CheckpointError``; the NF4 branch used to consume a second read for the
     quant state. The kernel now reads once, and this CPU test keeps that
-    contract pinned without a card.
+    contract pinned without a card. It also compares the loss and all eight
+    ``o_proj`` adapter grads against a second streamed model running peft's own
+    backward, so a wrong path through the NF4 backward cannot pass by producing
+    finite, non-zero grads.
     """
 
     def test_every_layer_receives_a_gradient(self, tmp_path):
@@ -1403,32 +1413,60 @@ class TestNf4StreamedOProjCheckpoint:
         from soup_cli.utils.layer_stream_runtime import decoder_owner
 
         model, _weights, _lora = _nf4_streamed_oproj(
-            tmp_path, device="cpu", dtype="float32"
+            tmp_path / "fast", device="cpu", dtype="float32"
+        )
+        reference, _ref_weights, _ref_lora = _nf4_streamed_oproj(
+            tmp_path / "reference", device="cpu", dtype="float32"
         )
         _randomise_lora_b(model, std=0.02)
+        assert _sync_adapters(reference, model) == 8
         assert patch_fast_lora_single_projection(model) == 4
         layers = decoder_owner(model).layers
         assert len(layers) == 4
         assert [layer.self_attn.o_proj.forward.__func__.__name__ for layer in layers] == [
             "_fast_lora_single_forward"
         ] * 4
+        assert all(
+            layer.self_attn.o_proj.forward.__func__.__name__ != "_fast_lora_single_forward"
+            for layer in decoder_owner(reference).layers
+        ), "the reference must stay unpatched"
 
         torch.manual_seed(11)
         input_ids = torch.randint(0, 64, (1, 8))
         labels = torch.randint(0, 64, (1, 8))
+        model.train()
+        reference.train()
         loss = model(input_ids=input_ids, labels=labels).loss
         assert torch.isfinite(loss)
         loss.backward()
+        reference_loss = reference(input_ids=input_ids, labels=labels).loss
+        assert torch.isfinite(reference_loss)
+        reference_loss.backward()
+
+        torch.testing.assert_close(loss, reference_loss, rtol=1e-4, atol=1e-5)
 
         grads = _oproj_grads(model)
+        reference_grads = _oproj_grads(reference)
         assert len(grads) == 8
+        assert len(reference_grads) == 8
         for layer in range(4):
             for ab in ("lora_A", "lora_B"):
                 suffix = f"layers.{layer}.self_attn.o_proj.{ab}.default.weight"
-                matches = [grad for name, grad in grads.items() if name.endswith(suffix)]
-                assert len(matches) == 1, (layer, ab, sorted(grads))
-                assert torch.isfinite(matches[0]).all(), (layer, ab)
-                assert matches[0].abs().max().item() > 0, (layer, ab)
+                streamed_match = [grad for name, grad in grads.items() if name.endswith(suffix)]
+                reference_match = [
+                    grad for name, grad in reference_grads.items() if name.endswith(suffix)
+                ]
+                assert len(streamed_match) == 1, (layer, ab, sorted(grads))
+                assert len(reference_match) == 1, (layer, ab, sorted(reference_grads))
+                assert torch.isfinite(streamed_match[0]).all(), (layer, ab)
+                assert streamed_match[0].abs().max().item() > 0, (layer, ab)
+                torch.testing.assert_close(
+                    streamed_match[0],
+                    reference_match[0],
+                    rtol=1e-4,
+                    atol=1e-5,
+                    msg=f"layer {layer} {ab}",
+                )
 
 
 @pytest.mark.gpu
@@ -1559,16 +1597,28 @@ class TestNf4StreamedOProjParity:
         for layer in range(4):
             for ab in ("lora_A", "lora_B"):
                 suffix = f"layers.{layer}.self_attn.o_proj.{ab}.default.weight"
-                s = [grad for name, grad in streamed_grads.items() if name.endswith(suffix)]
-                r = [grad for name, grad in resident_grads.items() if name.endswith(suffix)]
-                assert len(s) == 1, (layer, ab, sorted(streamed_grads))
-                assert len(r) == 1, (layer, ab, sorted(resident_grads))
-                assert torch.isfinite(s[0]).all(), (layer, ab)
-                assert s[0].abs().max().item() > 0, (layer, ab)
-                max_abs = (s[0] - r[0]).abs().max().item()
+                streamed_match = [
+                    grad for name, grad in streamed_grads.items() if name.endswith(suffix)
+                ]
+                resident_match = [
+                    grad for name, grad in resident_grads.items() if name.endswith(suffix)
+                ]
+                assert len(streamed_match) == 1, (layer, ab, sorted(streamed_grads))
+                assert len(resident_match) == 1, (layer, ab, sorted(resident_grads))
+                assert torch.isfinite(streamed_match[0]).all(), (layer, ab)
+                assert streamed_match[0].abs().max().item() > 0, (layer, ab)
+                max_abs = (streamed_match[0] - resident_match[0]).abs().max().item()
                 print(f"#839 streamed NF4 layer {layer} {ab}: max abs diff {max_abs:.3e}")
+                # The largest measured difference on the sm_75 card is 8.7e-4.
+                # atol=2e-3 leaves ~2.3x headroom over that reading while still
+                # rejecting a 10% dX error, which moves the downstream layer
+                # gradients by more than this bound.
                 torch.testing.assert_close(
-                    s[0], r[0], rtol=1e-2, atol=1e-2, msg=f"layer {layer} {ab}"
+                    streamed_match[0],
+                    resident_match[0],
+                    rtol=1e-2,
+                    atol=2e-3,
+                    msg=f"layer {layer} {ab}",
                 )
 
 
@@ -1584,12 +1634,16 @@ class TestMicroBenchmark:
         tool = shutil.which("nvidia-smi")
         if tool is None:
             return "unavailable"
-        proc = subprocess.run(
-            [tool, f"--query-gpu={fields}", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                [tool, f"--query-gpu={fields}", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return "unavailable"
         if proc.returncode != 0 or not proc.stdout.strip():
             return "unavailable"
         return proc.stdout.strip()
@@ -1673,7 +1727,7 @@ class TestMicroBenchmark:
         x = torch.randn(1, 2048, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         self._environment_header()
 
-        for r in (16, 64):
+        for rank in (16, 64):
             for kind in ("dense", "nf4"):
                 if kind == "dense":
                     layer = nn.Linear(4096, 4096, bias=False, dtype=torch.bfloat16)
@@ -1688,8 +1742,8 @@ class TestMicroBenchmark:
                 model = _Wrapper(layer).to("cuda")
                 inject_adapter_in_model(
                     LoraConfig(
-                        r=r,
-                        lora_alpha=2 * r,
+                        r=rank,
+                        lora_alpha=2 * rank,
                         lora_dropout=0.0,
                         bias="none",
                         target_modules=["linear"],
@@ -1700,7 +1754,7 @@ class TestMicroBenchmark:
                 assert patch_fast_lora_single_projection(model) == 1
                 fast_ms, fast_peak, fast_base = self._measure(model, x)
                 print(
-                    f"#839 o_proj bf16 {kind} r={r}: "
+                    f"#839 o_proj bf16 {kind} r={rank}: "
                     f"peft median={plain_ms:.2f}ms "
                     f"peak={plain_peak / 2**20:.0f}MiB "
                     f"(base {plain_base / 2**20:.0f}MiB, "
