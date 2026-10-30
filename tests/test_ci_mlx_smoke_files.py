@@ -47,9 +47,10 @@ EXEMPT: dict[str, str] = {
         "Where those three should run is a separate decision."
     ),
     "test_issue23_mlx_val_loss_producer.py": (
-        "its MLX test at :224 reads the installed mlx-lm source for the key names it sends as a "
-        "tripwire for an upstream release; like the max-grad-norm file, listing it would turn "
-        "the job red when mlx-lm changes, and that test does not exercise Soup code."
+        "its `test_upstream_still_sends_the_keys_this_reads` test reads the installed mlx-lm "
+        "source for the key names it sends as a tripwire for an upstream release; like the "
+        "max-grad-norm file, listing it would turn the job red when mlx-lm changes, and that "
+        "test does not exercise Soup code."
     ),
 }
 
@@ -78,17 +79,36 @@ def _needs_real_mlx(source: str) -> bool:
     return False
 
 
+def _job(workflow_text: str, job: str = JOB) -> dict[str, Any]:
+    return yaml.safe_load(workflow_text)["jobs"][job]
+
+
 def _steps(workflow_text: str, job: str = JOB) -> list[dict[str, Any]]:
-    return yaml.safe_load(workflow_text)["jobs"][job]["steps"]
+    return _job(workflow_text, job)["steps"]
 
 
-def _reject_failure_masks(steps: list[dict[str, Any]]) -> None:
-    """Refuse a step or shell line that would let a failing test job report green."""
+def _reject_failure_masks(
+    steps: list[dict[str, Any]], *, job: dict[str, Any] | None = None
+) -> None:
+    """Refuse a step, job, or shell line that would let a failing job report green.
+
+    GitHub accepts an expression for ``continue-on-error``, so only an absent
+    key or the boolean ``false`` is safe; every other value could evaluate true.
+    """
+    if (
+        job is not None
+        and "continue-on-error" in job
+        and job["continue-on-error"] is not False
+    ):
+        raise ValueError(
+            f"the `{JOB}` job has continue-on-error set to "
+            f"{job['continue-on-error']!r}; a failing test must fail the job"
+        )
     for step in steps:
-        if step.get("continue-on-error") in (True, "true"):
+        if "continue-on-error" in step and step["continue-on-error"] is not False:
             raise ValueError(
-                f"the `{JOB}` job has a step with continue-on-error: true; a failing test "
-                f"must fail the job"
+                f"the `{JOB}` job has a step with continue-on-error set to "
+                f"{step['continue-on-error']!r}; a failing test must fail the job"
             )
         for line in str(step.get("run", "")).splitlines():
             if "||" in line:
@@ -160,7 +180,8 @@ class TestEveryRealMlxTestFileRunsInTheJob:
             assert "addopts=" in words, words
 
     def test_no_step_masks_a_failure(self) -> None:
-        _reject_failure_masks(_steps(CI.read_text(encoding="utf-8")))
+        workflow = CI.read_text(encoding="utf-8")
+        _reject_failure_masks(_steps(workflow), job=_job(workflow))
 
 
 class TestFailureMasksAreRefused:
@@ -190,6 +211,35 @@ class TestFailureMasksAreRefused:
         mutated[0]["continue-on-error"] = True
         with pytest.raises(ValueError, match="continue-on-error"):
             _reject_failure_masks(mutated)
+
+    def test_the_string_true_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="continue-on-error"):
+            _reject_failure_masks(
+                [{"continue-on-error": "true", "run": "pytest -q tests/test_a.py"}]
+            )
+
+    def test_an_expression_that_could_be_true_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="continue-on-error"):
+            _reject_failure_masks(
+                [
+                    {
+                        "continue-on-error": "${{ github.event_name == 'push' }}",
+                        "run": "pytest -q tests/test_a.py",
+                    }
+                ]
+            )
+
+    def test_the_boolean_false_is_accepted(self) -> None:
+        _reject_failure_masks(
+            [{"continue-on-error": False, "run": "pytest -q tests/test_a.py"}]
+        )
+
+    def test_job_level_expression_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="continue-on-error"):
+            _reject_failure_masks(
+                [{"run": "pytest -q tests/test_a.py"}],
+                job={"continue-on-error": "${{ true }}"},
+            )
 
     def test_a_clean_job_is_accepted(self) -> None:
         _reject_failure_masks([{"run": "pytest -o addopts= -q tests/test_a.py"}])
